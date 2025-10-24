@@ -1,4 +1,4 @@
--- Compile Date: 04/25/2025 15:13:54 UTC
+-- Compile Date: 10/08/2025 13:08:35 UTC
 SET ANSI_NULLS ON;
 SET ANSI_PADDING ON;
 SET ANSI_WARNINGS ON;
@@ -71,8 +71,8 @@ BEGIN
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
     SELECT
-        @version = '2.4.4',
-        @version_date = '20250404';
+        @version = '2.6',
+        @version_date = '20250601';
 
     IF @help = 1
     BEGIN
@@ -203,9 +203,9 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     END;
 
     DECLARE
-        @sql nvarchar(max) =
+        @sql nvarchar(MAX) =
             N'',
-        @params nvarchar(max) =
+        @params nvarchar(MAX) =
             N'@start_date datetimeoffset(7),
               @end_date datetimeoffset(7)',
         @azure bit  =
@@ -874,13 +874,18 @@ AND   ca.utc_timestamp < @end_date';
                     id bigint IDENTITY,
                     collection_time datetime2(7) NOT NULL DEFAULT SYSDATETIME(),
                     event_time datetime2(7) NULL,
-                    node_id int NULL,
-                    memory_available_gb nvarchar(30) NULL,
-                    memory_requested_gb nvarchar(30) NULL,
-                    memory_allocator nvarchar(256) NULL,
-                    memory_allocation_type nvarchar(256) NULL,
-                    memory_clerk_name nvarchar(256) NULL,
-                    os_error int NULL,
+                    broker_id integer NULL,
+                    pool_metadata_id integer NULL,
+                    delta_time bigint NULL,
+                    memory_ratio integer NULL,
+                    new_target bigint NULL,
+                    overall bigint NULL,
+                    rate bigint NULL,
+                    currently_predicated bigint NULL,
+                    currently_allocated bigint NULL,
+                    previously_allocated bigint NULL,
+                    broker nvarchar(256) NULL,
+                    notification nvarchar(256) NULL,
                     PRIMARY KEY CLUSTERED (collection_time, id)
                 );
                 IF @debug = 1 BEGIN RAISERROR(''Created table %s for memory broker logging.'', 0, 1, ''' + @log_table_memory_broker + N''') WITH NOWAIT; END;
@@ -913,15 +918,33 @@ AND   ca.utc_timestamp < @end_date';
                     id bigint IDENTITY,
                     collection_time datetime2(7) NOT NULL DEFAULT SYSDATETIME(),
                     event_time datetime2(7) NULL,
-                    node_id int NULL,
-                    memory_available_kb nvarchar(30) NULL,
-                    memory_requested_kb nvarchar(30) NULL,
-                    memory_available_mb nvarchar(30) NULL,
-                    memory_requested_mb nvarchar(30) NULL,
-                    memory_allocator nvarchar(256) NULL,
-                    memory_allocation_type nvarchar(256) NULL,
-                    memory_clerk_name nvarchar(256) NULL,
-                    os_error int NULL,
+                    node_id integer NULL,
+                    memory_node_id integer NULL,
+                    memory_utilization_pct integer NULL,
+                    total_physical_memory_kb bigint NULL,
+                    available_physical_memory_kb bigint NULL,
+                    total_page_file_kb bigint NULL,
+                    available_page_file_kb bigint NULL,
+                    total_virtual_address_space_kb bigint NULL,
+                    available_virtual_address_space_kb bigint NULL,
+                    target_kb bigint NULL,
+                    reserved_kb bigint NULL,
+                    committed_kb bigint NULL,
+                    shared_committed_kb bigint NULL,
+                    awe_kb bigint NULL,
+                    pages_kb bigint NULL,
+                    failure_type nvarchar(256) NULL,
+                    failure_value integer NULL,
+                    resources integer NULL,
+                    factor_text nvarchar(256) NULL,
+                    factor_value integer NULL,
+                    last_error integer NULL,
+                    pool_metadata_id integer NULL,
+                    is_process_in_job nvarchar(10) NULL,
+                    is_system_physical_memory_high nvarchar(10) NULL,
+                    is_system_physical_memory_low nvarchar(10) NULL,
+                    is_process_physical_memory_low nvarchar(10) NULL,
+                    is_process_virtual_memory_low nvarchar(10) NULL,
                     PRIMARY KEY CLUSTERED (collection_time, id)
                 );
                 IF @debug = 1 BEGIN RAISERROR(''Created table %s for memory node OOM logging.'', 0, 1, ''' + @log_table_memory_node_oom + N''') WITH NOWAIT; END;
@@ -1041,12 +1064,12 @@ AND   ca.utc_timestamp < @end_date';
                     id bigint IDENTITY,
                     collection_time datetime2(7) NOT NULL DEFAULT SYSDATETIME(),
                     event_time datetime2(7) NULL,
-                    error_number int NULL,
-                    severity int NULL,
-                    state int NULL,
+                    error_number integer NULL,
+                    severity integer NULL,
+                    state integer NULL,
                     message nvarchar(max) NULL,
                     database_name sysname NULL,
-                    database_id int NULL,
+                    database_id integer NULL,
                     PRIMARY KEY CLUSTERED (collection_time, id)
                 );
                 IF @debug = 1 BEGIN RAISERROR(''Created table %s for severe errors logging.'', 0, 1, ''' + @log_table_severe_errors + N''') WITH NOWAIT; END;
@@ -1183,6 +1206,7 @@ AND   ca.utc_timestamp < @end_date';
         ('locking', 'xml_deadlock_report', '#xml_deadlock_report', 'xml_deadlock_report'),
         ('locking', 'sp_server_diagnostics_component_result', '#sp_server_diagnostics_component_result', 'sp_server_diagnostics_component_result'),
         ('waits', 'wait_info', '#wait_info', 'wait_info'),
+        ('waits', 'sp_server_diagnostics_component_result', '#sp_server_diagnostics_component_result', 'sp_server_diagnostics_component_result'),
         ('system', 'sp_server_diagnostics_component_result', '#sp_server_diagnostics_component_result', 'sp_server_diagnostics_component_result'),
         ('system', 'error_reported', '#error_reported', 'error_reported'),
         ('memory', 'memory_broker_ring_buffer_recorded', '#memory_broker', 'memory_broker'),
@@ -1638,6 +1662,30 @@ AND   ca.utc_timestamp < @end_date';
             OPTION(RECOMPILE);
         END;
 
+        /* Add memory node OOM collection for MI */
+        IF @what_to_check IN ('all', 'memory')
+        BEGIN
+            IF @debug = 1
+            BEGIN
+                RAISERROR('Checking Managed Instance memory node OOM events', 0, 0) WITH NOWAIT;
+                RAISERROR('Inserting #memory_node_oom', 0, 0) WITH NOWAIT;
+            END;
+
+            INSERT
+                #memory_node_oom
+            WITH
+                (TABLOCKX)
+            (
+                memory_node_oom
+            )
+            SELECT
+                e.x.query('.')
+            FROM #ring_buffer AS rb
+            CROSS APPLY rb.ring_buffer.nodes('/event') AS e(x)
+            WHERE e.x.exist('@name[.= "memory_node_oom_ring_buffer_recorded"]') = 1
+            OPTION(RECOMPILE);
+        END;
+
     END; /*End Managed Instance collection*/
 
     IF @debug = 1
@@ -1772,7 +1820,7 @@ AND   ca.utc_timestamp < @end_date';
                                  RTRIM(CONVERT(date, @end_date)) +
                                  ' with a minimum duration of ' +
                                  RTRIM(@wait_duration_ms) +
-                                 '.'
+                                 'ms.'
                             ELSE 'no queries with significant waits found!'
                         END;
 
@@ -1944,7 +1992,6 @@ AND   ca.utc_timestamp < @end_date';
         CROSS APPLY wi.sp_server_diagnostics_component_result.nodes('/event') AS w(x)
         CROSS APPLY w.x.nodes('/event/data/value/queryProcessing/topWaits/nonPreemptive/byCount/wait') AS w2(x2)
         WHERE w.x.exist('(data[@name="component"]/text[.= "QUERY_PROCESSING"])') = 1
-        AND  (w.x.exist('(data[@name="state"]/text[.= "WARNING"])') = @warnings_only OR @warnings_only = 0)
         AND   NOT EXISTS
               (
                   SELECT
@@ -2199,7 +2246,6 @@ AND   ca.utc_timestamp < @end_date';
         CROSS APPLY wi.sp_server_diagnostics_component_result.nodes('/event') AS w(x)
         CROSS APPLY w.x.nodes('/event/data/value/queryProcessing/topWaits/nonPreemptive/byDuration/wait') AS w2(x2)
         WHERE w.x.exist('(data[@name="component"]/text[.= "QUERY_PROCESSING"])') = 1
-        AND  (w.x.exist('(data[@name="state"]/text[.= "WARNING"])') = @warnings_only OR @warnings_only = 0)
         AND   w2.x2.exist('@averageWaitTime[.>= sql:variable("@wait_duration_ms")]') = 1
         AND   NOT EXISTS
               (
@@ -2284,7 +2330,7 @@ AND   ca.utc_timestamp < @end_date';
                                  RTRIM(CONVERT(date, @end_date)) +
                                  ' with a minimum average duration of ' +
                                  RTRIM(@wait_duration_ms) +
-                                 '.'
+                                 'ms.'
                             ELSE 'no significant waits found!'
                         END
 
@@ -2723,146 +2769,153 @@ AND   ca.utc_timestamp < @end_date';
             ORDER BY
                 x.event_time DESC;
         END;
-
-END;
+    END;
 
     /* CPU task details logging section */
-    IF NOT EXISTS
-    (
-        SELECT
-            1/0
-        FROM #scheduler_details AS sd
-    )
+    IF @what_to_check IN ('all', 'cpu')
     BEGIN
-        IF @log_to_table = 0
-            BEGIN
-            /* No results logic, only return if not logging */
-            SELECT
-                finding =
-                    CASE
-                        WHEN @what_to_check NOT IN ('all', 'cpu')
-                        THEN 'cpu skipped, @what_to_check set to ' +
-                             @what_to_check
-                        WHEN @what_to_check IN ('all', 'cpu')
-                        THEN 'no cpu issues found between ' +
-                             RTRIM(CONVERT(date, @start_date)) +
-                             ' and ' +
-                             RTRIM(CONVERT(date, @end_date)) +
-                             ' with @warnings_only set to ' +
-                             RTRIM(@warnings_only) +
-                             '.'
-                        ELSE 'no cpu issues found!'
-                    END
-
-            RAISERROR('No scheduler data found', 0, 0) WITH NOWAIT;
-        END;
-    END;
-    ELSE
-    BEGIN
-        /* Build the query */
-        SET @dsql = N'
-            SELECT
-                ' + CASE
-                        WHEN @log_to_table = 1
-                        THEN N''
-                        ELSE N'finding = ''cpu task details'','
-                    END +
-              N'
-                sd.event_time,
-                sd.state,
-                sd.maxWorkers,
-                sd.workersCreated,
-                sd.workersIdle,
-                sd.tasksCompletedWithinInterval,
-                sd.pendingTasks,
-                sd.oldestPendingTaskWaitingTime,
-                sd.hasUnresolvableDeadlockOccurred,
-                sd.hasDeadlockedSchedulersOccurred,
-                sd.didBlockingOccur
-            FROM #scheduler_details AS sd';
-
-        /* Add the WHERE clause only for table logging */
-        IF @log_to_table = 1
+        IF @debug = 1
         BEGIN
-            /* Get max event_time for CPU task details */
-            SET @mdsql_execute =
-                REPLACE
-                (
+            RAISERROR('Parsing scheduler stuff', 0, 0) WITH NOWAIT;
+        END;
+
+        IF NOT EXISTS
+        (
+            SELECT
+                1/0
+            FROM #scheduler_details AS sd
+        )
+        BEGIN
+            IF @log_to_table = 0
+                BEGIN
+                /* No results logic, only return if not logging */
+                SELECT
+                    finding =
+                        CASE
+                            WHEN @what_to_check NOT IN ('all', 'cpu')
+                            THEN 'cpu skipped, @what_to_check set to ' +
+                                 @what_to_check
+                            WHEN @what_to_check IN ('all', 'cpu')
+                            THEN 'no cpu issues found between ' +
+                                 RTRIM(CONVERT(date, @start_date)) +
+                                 ' and ' +
+                                 RTRIM(CONVERT(date, @end_date)) +
+                                 ' with @warnings_only set to ' +
+                                 RTRIM(@warnings_only) +
+                                 '.'
+                            ELSE 'no cpu issues found!'
+                        END
+
+                RAISERROR('No scheduler data found', 0, 0) WITH NOWAIT;
+            END;
+        END;
+        ELSE
+        BEGIN
+            /* Build the query */
+            SET @dsql = N'
+                SELECT
+                    ' + CASE
+                            WHEN @log_to_table = 1
+                            THEN N''
+                            ELSE N'finding = ''cpu task details'','
+                        END +
+                  N'
+                    sd.event_time,
+                    sd.state,
+                    sd.maxWorkers,
+                    sd.workersCreated,
+                    sd.workersIdle,
+                    sd.tasksCompletedWithinInterval,
+                    sd.pendingTasks,
+                    sd.oldestPendingTaskWaitingTime,
+                    sd.hasUnresolvableDeadlockOccurred,
+                    sd.hasDeadlockedSchedulersOccurred,
+                    sd.didBlockingOccur
+                FROM #scheduler_details AS sd';
+
+            /* Add the WHERE clause only for table logging */
+            IF @log_to_table = 1
+            BEGIN
+                /* Get max event_time for CPU task details */
+                SET @mdsql_execute =
                     REPLACE
                     (
-                        @mdsql_template,
-                        '{table_check}',
-                        @log_table_cpu_tasks
-                    ),
-                    '{date_column}',
-                    'event_time'
-                );
+                        REPLACE
+                        (
+                            @mdsql_template,
+                            '{table_check}',
+                            @log_table_cpu_tasks
+                        ),
+                        '{date_column}',
+                        'event_time'
+                    );
 
-            IF @debug = 1
-            BEGIN
-                PRINT @mdsql_execute;
+                IF @debug = 1
+                BEGIN
+                    PRINT @mdsql_execute;
+                END;
+
+                EXECUTE sys.sp_executesql
+                    @mdsql_execute,
+                  N'@max_event_time datetime2(7) OUTPUT',
+                    @max_event_time OUTPUT;
+
+                SET @dsql += N'
+            WHERE sd.event_time > @max_event_time';
             END;
 
-            EXECUTE sys.sp_executesql
-                @mdsql_execute,
-              N'@max_event_time datetime2(7) OUTPUT',
-                @max_event_time OUTPUT;
-
+            /* Add the ORDER BY clause */
             SET @dsql += N'
-        WHERE sd.event_time > @max_event_time';
-        END;
+            ORDER BY
+                sd.event_time DESC
+            OPTION(RECOMPILE);
+            ';
 
-        /* Add the ORDER BY clause */
-        SET @dsql += N'
-        ORDER BY
-            sd.event_time DESC
-        OPTION(RECOMPILE);
-        ';
-
-        /* Handle table logging */
-        IF @log_to_table = 1
-        BEGIN
-            SET @insert_sql = N'
-            INSERT INTO
-                ' + @log_table_cpu_tasks + N'
-            (
-                event_time,
-                state,
-                maxWorkers,
-                workersCreated,
-                workersIdle,
-                tasksCompletedWithinInterval,
-                pendingTasks,
-                oldestPendingTaskWaitingTime,
-                hasUnresolvableDeadlockOccurred,
-                hasDeadlockedSchedulersOccurred,
-                didBlockingOccur
-            )' +
-                @dsql;
-
-            IF @debug = 1
+            /* Handle table logging */
+            IF @log_to_table = 1
             BEGIN
-                PRINT @insert_sql;
+                SET @insert_sql = N'
+                INSERT INTO
+                    ' + @log_table_cpu_tasks + N'
+                (
+                    event_time,
+                    state,
+                    maxWorkers,
+                    workersCreated,
+                    workersIdle,
+                    tasksCompletedWithinInterval,
+                    pendingTasks,
+                    oldestPendingTaskWaitingTime,
+                    hasUnresolvableDeadlockOccurred,
+                    hasDeadlockedSchedulersOccurred,
+                    didBlockingOccur
+                )' +
+                    @dsql;
+
+                IF @debug = 1
+                BEGIN
+                    PRINT @insert_sql;
+                END;
+
+                EXECUTE sys.sp_executesql
+                    @insert_sql,
+                  N'@max_event_time datetime2(7)',
+                    @max_event_time;
             END;
 
-            EXECUTE sys.sp_executesql
-                @insert_sql,
-              N'@max_event_time datetime2(7)',
-                @max_event_time;
-        END;
-
-        /* Execute the query for client results */
-        IF @log_to_table = 0
-        BEGIN
-            IF @debug = 1
+            /* Execute the query for client results */
+            IF @log_to_table = 0
             BEGIN
-                PRINT @dsql;
-            END;
+                IF @debug = 1
+                BEGIN
+                    PRINT @dsql;
+                END;
 
-            EXECUTE sys.sp_executesql
-                @dsql;
+                EXECUTE sys.sp_executesql
+                    @dsql;
+            END;
         END;
-    END; /*End CPU*/
+    END;/*End CPU*/
 
     /*Grab memory details*/
     IF @what_to_check IN ('all', 'memory')
@@ -3135,19 +3188,23 @@ END;
                     ),
                     w.x.value('@timestamp', 'datetime2')
                 ),
-            notification_type = w.x.value('(data[@name="notification_type"]/text)[1]', 'nvarchar(256)'),
-            reclaim_target_kb = w.x.value('(data[@name="reclaim_target_kb"]/value)[1]', 'bigint'),
-            reclaimed_kb = w.x.value('(data[@name="reclaimed_kb"]/value)[1]', 'bigint'),
-            pressure = w.x.value('(data[@name="pressure"]/value)[1]', 'bigint'),
-            currently_available_kb = w.x.value('(data[@name="currently_available_kb"]/value)[1]', 'bigint'),
-            reserved_kb = w.x.value('(data[@name="reserved_kb"]/value)[1]', 'bigint'),
-            committed_kb = w.x.value('(data[@name="committed_kb"]/value)[1]', 'bigint'),
-            worker_count = w.x.value('(data[@name="worker_count"]/value)[1]', 'integer'),
+            broker_id = w.x.value('(data[@name="id"]/value)[1]', 'integer'),
+            pool_metadata_id = w.x.value('(data[@name="pool_metadata_id"]/value)[1]', 'integer'),
+            delta_time = w.x.value('(data[@name="delta_time"]/value)[1]', 'bigint'),
+            memory_ratio = w.x.value('(data[@name="memory_ratio"]/value)[1]', 'integer'),
+            new_target = w.x.value('(data[@name="new_target"]/value)[1]', 'bigint'),
+            overall = w.x.value('(data[@name="overall"]/value)[1]', 'bigint'),
+            rate = w.x.value('(data[@name="rate"]/value)[1]', 'bigint'),
+            currently_predicated = w.x.value('(data[@name="currently_predicated"]/value)[1]', 'bigint'),
+            currently_allocated = w.x.value('(data[@name="currently_allocated"]/value)[1]', 'bigint'),
+            previously_allocated = w.x.value('(data[@name="previously_allocated"]/value)[1]', 'bigint'),
+            broker = w.x.value('(data[@name="broker"]/value)[1]', 'nvarchar(256)'),
+            notification = w.x.value('(data[@name="notification"]/value)[1]', 'nvarchar(256)'),
             xml = w.x.query('.')
         INTO #memory_broker_info
         FROM #memory_broker AS mb
         CROSS APPLY mb.memory_broker.nodes('//event') AS w(x)
-        WHERE (w.x.exist('(data[@name="notification_type"]/text[.= "RESOURCE_MEMPHYSICAL_LOW"])') = @warnings_only OR @warnings_only = 0)
+        WHERE (w.x.exist('(data[@name="notification"]/value[.= "RESOURCE_MEMPHYSICAL_LOW"])') = @warnings_only OR @warnings_only = 0)
         OPTION(RECOMPILE);
 
         IF @debug = 1
@@ -3193,54 +3250,116 @@ END;
         END;
         ELSE
         BEGIN
-            /* Build the query for memory node OOM events */
+            /* Build the query for memory broker notifications */
             SET @dsql = N'
             SELECT
                 ' + CASE
                         WHEN @log_to_table = 1
-                        THEN N''
-                        ELSE N'finding = ''memory node OOM events'','
+                        THEN N'mbi.event_time,
+                mbi.broker_id,
+                mbi.pool_metadata_id,
+                mbi.delta_time,
+                mbi.memory_ratio,
+                mbi.new_target,
+                mbi.overall,
+                mbi.rate,
+                mbi.currently_predicated,
+                mbi.currently_allocated,
+                mbi.previously_allocated,
+                mbi.broker,
+                mbi.notification'
+                        ELSE N'finding = ''memory broker notifications'',
+                mbi.event_time,
+                mbi.broker_id,
+                mbi.pool_metadata_id,
+                mbi.delta_time,
+                mbi.memory_ratio,
+                new_target_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mbi.new_target / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                overall_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mbi.overall / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                mbi.rate,
+                currently_predicated_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mbi.currently_predicated / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                currently_allocated_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mbi.currently_allocated / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                previously_allocated_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mbi.previously_allocated / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                mbi.broker,
+                mbi.notification'
                     END +
               N'
-                mnoi.event_time,
-                mnoi.node_id,
-                memory_available_gb =
-                    REPLACE
-                    (
-                        CONVERT
-                        (
-                            nvarchar(30),
-                            CONVERT
-                            (
-                                money,
-                                mnoi.memory_available_kb / 1024.0 / 1024.0
-                            ),
-                            1
-                        ),
-                    N''.00'',
-                    N''''
-                    ),
-                memory_requested_gb =
-                    REPLACE
-                    (
-                        CONVERT
-                        (
-                            nvarchar(30),
-                            CONVERT
-                            (
-                                money,
-                                mnoi.memory_requested_kb / 1024.0 / 1024.0
-                            ),
-                            1
-                        ),
-                    N''.00'',
-                    N''''
-                    ),
-                mnoi.memory_allocator,
-                mnoi.memory_allocation_type,
-                mnoi.memory_clerk_name,
-                mnoi.os_error
-            FROM #memory_node_oom_info AS mnoi';
+            FROM #memory_broker_info AS mbi';
 
             /* Add the WHERE clause only for table logging */
             IF @log_to_table = 1
@@ -3288,13 +3407,18 @@ END;
                 + @log_table_memory_broker + N'
             (
                 event_time,
-                node_id,
-                memory_available_gb,
-                memory_requested_gb,
-                memory_allocator,
-                memory_allocation_type,
-                memory_clerk_name,
-                os_error
+                broker_id,
+                pool_metadata_id,
+                delta_time,
+                memory_ratio,
+                new_target,
+                overall,
+                rate,
+                currently_predicated,
+                currently_allocated,
+                previously_allocated,
+                broker,
+                notification
             )' +
                 @dsql;
 
@@ -3344,13 +3468,33 @@ END;
                     ),
                     w.x.value('@timestamp', 'datetime2')
                 ),
-            node_id = w.x.value('(data[@name="id"]/value)[1]', 'int'),
-            memory_available_kb = w.x.value('(data[@name="availableMemory"]/value)[1]', 'bigint'),
-            memory_requested_kb = w.x.value('(data[@name="requestedMemory"]/value)[1]', 'bigint'),
-            memory_allocator = w.x.value('(data[@name="allocator"]/text)[1]', 'nvarchar(256)'),
-            memory_allocation_type = w.x.value('(data[@name="allocationType"]/text)[1]', 'nvarchar(256)'),
-            memory_clerk_name = w.x.value('(data[@name="memoryClerk"]/text)[1]', 'nvarchar(256)'),
-            os_error = w.x.value('(data[@name="oserror"]/value)[1]', 'integer'),
+            node_id = w.x.value('(data[@name="id"]/value)[1]', 'integer'),
+            memory_node_id = w.x.value('(data[@name="memory_node_id"]/value)[1]', 'integer'),
+            memory_utilization_pct = w.x.value('(data[@name="memory_utilization_pct"]/value)[1]', 'integer'),
+            total_physical_memory_kb = w.x.value('(data[@name="total_physical_memory_kb"]/value)[1]', 'bigint'),
+            available_physical_memory_kb = w.x.value('(data[@name="available_physical_memory_kb"]/value)[1]', 'bigint'),
+            total_page_file_kb = w.x.value('(data[@name="total_page_file_kb"]/value)[1]', 'bigint'),
+            available_page_file_kb = w.x.value('(data[@name="available_page_file_kb"]/value)[1]', 'bigint'),
+            total_virtual_address_space_kb = w.x.value('(data[@name="total_virtual_address_space_kb"]/value)[1]', 'bigint'),
+            available_virtual_address_space_kb = w.x.value('(data[@name="available_virtual_address_space_kb"]/value)[1]', 'bigint'),
+            target_kb = w.x.value('(data[@name="target_kb"]/value)[1]', 'bigint'),
+            reserved_kb = w.x.value('(data[@name="reserved_kb"]/value)[1]', 'bigint'),
+            committed_kb = w.x.value('(data[@name="committed_kb"]/value)[1]', 'bigint'),
+            shared_committed_kb = w.x.value('(data[@name="shared_committed_kb"]/value)[1]', 'bigint'),
+            awe_kb = w.x.value('(data[@name="awe_kb"]/value)[1]', 'bigint'),
+            pages_kb = w.x.value('(data[@name="pages_kb"]/value)[1]', 'bigint'),
+            failure_type = w.x.value('(data[@name="failure"]/text)[1]', 'nvarchar(256)'),
+            failure_value = w.x.value('(data[@name="failure"]/value)[1]', 'integer'),
+            resources = w.x.value('(data[@name="resources"]/value)[1]', 'integer'),
+            factor_text = w.x.value('(data[@name="factor"]/text)[1]', 'nvarchar(256)'),
+            factor_value = w.x.value('(data[@name="factor"]/value)[1]', 'integer'),
+            last_error = w.x.value('(data[@name="last_error"]/value)[1]', 'integer'),
+            pool_metadata_id = w.x.value('(data[@name="pool_metadata_id"]/value)[1]', 'integer'),
+            is_process_in_job = w.x.value('(data[@name="is_process_in_job"]/value)[1]', 'nvarchar(10)'),
+            is_system_physical_memory_high = w.x.value('(data[@name="is_system_physical_memory_high"]/value)[1]', 'nvarchar(10)'),
+            is_system_physical_memory_low = w.x.value('(data[@name="is_system_physical_memory_low"]/value)[1]', 'nvarchar(10)'),
+            is_process_physical_memory_low = w.x.value('(data[@name="is_process_physical_memory_low"]/value)[1]', 'nvarchar(10)'),
+            is_process_virtual_memory_low = w.x.value('(data[@name="is_process_virtual_memory_low"]/value)[1]', 'nvarchar(10)'),
             xml = w.x.query('.')
         INTO #memory_node_oom_info
         FROM #memory_node_oom AS mno
@@ -3398,18 +3542,45 @@ END;
         END;
         ELSE
         BEGIN
-            /* Build the query for memory broker notifications */
+            /* Build the query for memory node OOM events */
             SET @dsql = N'
             SELECT
                 ' + CASE
                         WHEN @log_to_table = 1
-                        THEN N''
-                        ELSE N'finding = ''memory broker notifications'','
-                    END +
-              N'
-                mbi.event_time,
-                mbi.notification_type,
-                reclaim_target_gb =
+                        THEN N'mnoi.event_time,
+                mnoi.node_id,
+                mnoi.memory_node_id,
+                mnoi.memory_utilization_pct,
+                mnoi.total_physical_memory_kb,
+                mnoi.available_physical_memory_kb,
+                mnoi.total_page_file_kb,
+                mnoi.available_page_file_kb,
+                mnoi.total_virtual_address_space_kb,
+                mnoi.available_virtual_address_space_kb,
+                mnoi.target_kb,
+                mnoi.reserved_kb,
+                mnoi.committed_kb,
+                mnoi.shared_committed_kb,
+                mnoi.awe_kb,
+                mnoi.pages_kb,
+                mnoi.failure_type,
+                mnoi.failure_value,
+                mnoi.resources,
+                mnoi.factor_text,
+                mnoi.factor_value,
+                mnoi.last_error,
+                mnoi.pool_metadata_id,
+                mnoi.is_process_in_job,
+                mnoi.is_system_physical_memory_high,
+                mnoi.is_system_physical_memory_low,
+                mnoi.is_process_physical_memory_low,
+                mnoi.is_process_virtual_memory_low'
+                        ELSE N'finding = ''memory node OOM events'',
+                mnoi.event_time,
+                mnoi.node_id,
+                mnoi.memory_node_id,
+                mnoi.memory_utilization_pct,
+                total_physical_memory_gb =
                     REPLACE
                     (
                         CONVERT
@@ -3418,14 +3589,14 @@ END;
                             CONVERT
                             (
                                 money,
-                                mbi.reclaim_target_kb / 1024.0 / 1024.0
+                                mnoi.total_physical_memory_kb / 1024.0 / 1024.0
                             ),
                             1
                         ),
                     N''.00'',
                     N''''
                     ),
-                reclaimed_gb =
+                available_physical_memory_gb =
                     REPLACE
                     (
                         CONVERT
@@ -3434,20 +3605,14 @@ END;
                             CONVERT
                             (
                                 money,
-                                mbi.reclaimed_kb / 1024.0 / 1024.0
+                                mnoi.available_physical_memory_kb / 1024.0 / 1024.0
                             ),
                             1
                         ),
                     N''.00'',
                     N''''
                     ),
-                reclaim_success_percent =
-                    CASE
-                        WHEN mbi.reclaim_target_kb > 0
-                        THEN CONVERT(DECIMAL(5,2), 100.0 * mbi.reclaimed_kb / mbi.reclaim_target_kb)
-                        ELSE 0
-                    END,
-                pressure_gb =
+                total_page_file_gb =
                     REPLACE
                     (
                         CONVERT
@@ -3456,14 +3621,14 @@ END;
                             CONVERT
                             (
                                 money,
-                                mbi.pressure_mb / 1024.0
+                                mnoi.total_page_file_kb / 1024.0 / 1024.0
                             ),
                             1
                         ),
                     N''.00'',
                     N''''
                     ),
-                currently_available_gb =
+                available_page_file_gb =
                     REPLACE
                     (
                         CONVERT
@@ -3472,7 +3637,23 @@ END;
                             CONVERT
                             (
                                 money,
-                                mbi.currently_available_kb / 1024.0 / 1024.0
+                                mnoi.available_page_file_kb / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                target_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mnoi.target_kb / 1024.0 / 1024.0
                             ),
                             1
                         ),
@@ -3488,7 +3669,7 @@ END;
                             CONVERT
                             (
                                 money,
-                                mbi.reserved_kb / 1024.0 / 1024.0
+                                mnoi.reserved_kb / 1024.0 / 1024.0
                             ),
                             1
                         ),
@@ -3504,15 +3685,76 @@ END;
                             CONVERT
                             (
                                 money,
-                                mbi.committed_kb / 1024.0 / 1024.0
+                                mnoi.committed_kb / 1024.0 / 1024.0
                             ),
                             1
                         ),
                     N''.00'',
                     N''''
                     ),
-                mbi.worker_count
-            FROM #memory_broker_info AS mbi';
+                shared_committed_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mnoi.shared_committed_kb / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                awe_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mnoi.awe_kb / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                pages_gb =
+                    REPLACE
+                    (
+                        CONVERT
+                        (
+                            nvarchar(30),
+                            CONVERT
+                            (
+                                money,
+                                mnoi.pages_kb / 1024.0 / 1024.0
+                            ),
+                            1
+                        ),
+                    N''.00'',
+                    N''''
+                    ),
+                mnoi.failure_type,
+                mnoi.failure_value,
+                mnoi.resources,
+                mnoi.factor_text,
+                mnoi.factor_value,
+                mnoi.last_error,
+                mnoi.pool_metadata_id,
+                mnoi.is_process_in_job,
+                mnoi.is_system_physical_memory_high,
+                mnoi.is_system_physical_memory_low,
+                mnoi.is_process_physical_memory_low,
+                mnoi.is_process_virtual_memory_low'
+                    END +
+              N'
+            FROM #memory_node_oom_info AS mnoi';
 
             /* Add the WHERE clause only for table logging */
             IF @log_to_table = 1
@@ -3560,15 +3802,33 @@ END;
                 ' + @log_table_memory_node_oom + N'
             (
                 event_time,
-                notification_type,
-                reclaim_target_gb,
-                reclaimed_gb,
-                reclaim_success_percent,
-                pressure_gb,
-                currently_available_gb,
-                reserved_gb,
-                committed_gb,
-                worker_count
+                node_id,
+                memory_node_id,
+                memory_utilization_pct,
+                total_physical_memory_kb,
+                available_physical_memory_kb,
+                total_page_file_kb,
+                available_page_file_kb,
+                total_virtual_address_space_kb,
+                available_virtual_address_space_kb,
+                target_kb,
+                reserved_kb,
+                committed_kb,
+                shared_committed_kb,
+                awe_kb,
+                pages_kb,
+                failure_type,
+                failure_value,
+                resources,
+                factor_text,
+                factor_value,
+                last_error,
+                pool_metadata_id,
+                is_process_in_job,
+                is_system_physical_memory_high,
+                is_system_physical_memory_low,
+                is_process_physical_memory_low,
+                is_process_virtual_memory_low
             )' +
                 @dsql;
 
@@ -4204,7 +4464,8 @@ END;
             END;
 
             /* For ignored errors, only display to client */
-            IF @log_to_table = 0
+            IF  @log_to_table = 0
+            AND @debug = 1
             BEGIN
                 SELECT
                     error_numbers_ignored =
@@ -4366,7 +4627,7 @@ END;
             isolation_level = bd.value('(process/@isolationlevel)[1]', 'nvarchar(50)'),
             log_used = bd.value('(process/@logused)[1]', 'bigint'),
             clientoption1 = bd.value('(process/@clientoption1)[1]', 'bigint'),
-            clientoption2 = bd.value('(process/@clientoption1)[1]', 'bigint'),
+            clientoption2 = bd.value('(process/@clientoption2)[1]', 'bigint'),
             activity = CASE WHEN bd.exist('//blocked-process-report/blocked-process') = 1 THEN 'blocked' END,
             blocked_process_report = bd.query('.')
         INTO #blocked
@@ -4427,7 +4688,7 @@ END;
             isolation_level = bg.value('(process/@isolationlevel)[1]', 'nvarchar(50)'),
             log_used = bg.value('(process/@logused)[1]', 'bigint'),
             clientoption1 = bg.value('(process/@clientoption1)[1]', 'bigint'),
-            clientoption2 = bg.value('(process/@clientoption1)[1]', 'bigint'),
+            clientoption2 = bg.value('(process/@clientoption2)[1]', 'bigint'),
             activity = CASE WHEN bg.exist('//blocked-process-report/blocking-process') = 1 THEN 'blocking' END,
             blocked_process_report = bg.query('.')
         INTO #blocking
@@ -5370,8 +5631,8 @@ SET XACT_ABORT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 SELECT
-    @version = '6.4.4',
-    @version_date = '20250404';
+    @version = '6.6',
+    @version_date = '20250601';
 
 IF @help = 1
 BEGIN
@@ -10152,6 +10413,7 @@ ALTER PROCEDURE
     @log_schema_name sysname = NULL, /*schema to store logging tables*/
     @log_table_name_prefix sysname = 'HumanEventsBlockViewer', /*prefix for all logging tables*/
     @log_retention_days integer = 30, /*Number of days to keep logs, 0 = keep indefinitely*/
+    @max_blocking_events integer = 5000, /*maximum blocking events to analyze, 0 = unlimited*/
     @help bit = 0, /*get help with this procedure*/
     @debug bit = 0, /*print dynamic sql and select temp table contents*/
     @version varchar(30) = NULL OUTPUT, /*check the version number*/
@@ -10166,8 +10428,8 @@ SET XACT_ABORT OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 SELECT
-    @version = '4.4.4',
-    @version_date = '20250404';
+    @version = '4.6',
+    @version_date = '20250601';
 
 IF @help = 1
 BEGIN
@@ -10179,6 +10441,7 @@ BEGIN
     SELECT  'it will also work with any other extended event session that captures blocking' UNION ALL
     SELECT  'just use the @session_name parameter to point me there' UNION ALL
     SELECT  'EXECUTE dbo.sp_HumanEventsBlockViewer @session_name = N''blocked_process_report'';' UNION ALL
+    SELECT  'the system_health session also works, if you are okay with its lousy blocked process report'
     SELECT  'all scripts and documentation are available here: https://code.erikdarling.com' UNION ALL
     SELECT  'from your loving sql server consultant, erik darling: https://erikdarling.com';
 
@@ -10204,6 +10467,7 @@ BEGIN
                  WHEN N'@log_schema_name' THEN N'schema to store logging tables'
                  WHEN N'@log_table_name_prefix' THEN N'prefix for all logging tables'
                  WHEN N'@log_retention_days' THEN N'how many days of data to retain'
+                 WHEN N'@max_blocking_events' THEN N'maximum blocking events to analyze, 0 = unlimited'
                  WHEN N'@help' THEN 'how you got here'
                  WHEN N'@debug' THEN 'dumps raw temp table contents'
                  WHEN N'@version' THEN 'OUTPUT; for support'
@@ -10211,8 +10475,8 @@ BEGIN
             END,
         valid_inputs =
             CASE ap.name
-                 WHEN N'@session_name' THEN 'extended event session name capturing sqlserver.blocked_process_report'
-                 WHEN N'@target_type' THEN 'event_file or ring_buffer'
+                 WHEN N'@session_name' THEN 'extended event session name capturing sqlserver.blocked_process_report, system_health also works'
+                 WHEN N'@target_type' THEN 'event_file or ring_buffer or table'
                  WHEN N'@start_date' THEN 'a reasonable date'
                  WHEN N'@end_date' THEN 'a reasonable date'
                  WHEN N'@database_name' THEN 'a database that exists on this server'
@@ -10227,6 +10491,7 @@ BEGIN
                  WHEN N'@log_schema_name' THEN N'any valid schema name'
                  WHEN N'@log_table_name_prefix' THEN N'any valid identifier'
                  WHEN N'@log_retention_days' THEN N'a positive integer'
+                 WHEN N'@max_blocking_events' THEN N'0 to 2147483647 (0 = unlimited)'
                  WHEN N'@help' THEN '0 or 1'
                  WHEN N'@debug' THEN '0 or 1'
                  WHEN N'@version' THEN 'none; OUTPUT'
@@ -10250,6 +10515,7 @@ BEGIN
                  WHEN N'@log_schema_name' THEN N'NULL (dbo)'
                  WHEN N'@log_table_name_prefix' THEN N'HumanEventsBlockViewer'
                  WHEN N'@log_retention_days' THEN N'30'
+                 WHEN N'@max_blocking_events' THEN N'5000'
                  WHEN N'@help' THEN '0'
                  WHEN N'@debug' THEN '0'
                  WHEN N'@version' THEN 'none; OUTPUT'
@@ -10269,7 +10535,7 @@ BEGIN
             N'check the messages tab for setup commands';
 
     RAISERROR('
-The blocked process report needs to be enabled:
+Unless you want to use the lousy version in system_health, the blocked process report needs to be enabled:
 EXECUTE sys.sp_configure ''show advanced options'', 1;
 EXECUTE sys.sp_configure ''blocked process threshold'', 5; /* Seconds of blocking before a report is generated */
 RECONFIGURE;', 0, 1) WITH NOWAIT;
@@ -10345,10 +10611,11 @@ IF EXISTS
         1/0
     FROM sys.configurations AS c
     WHERE c.name = N'blocked process threshold (s)'
-    AND   CONVERT(int, c.value_in_use) = 0
+    AND   CONVERT(integer, c.value_in_use) = 0
 )
+AND @session_name NOT LIKE N'system%health'
 BEGIN
-    RAISERROR(N'The blocked process report needs to be enabled:
+    RAISERROR(N'Unless you want to use the lousy version in system_health, the blocked process report needs to be enabled:
 EXECUTE sys.sp_configure ''show advanced options'', 1;
 EXECUTE sys.sp_configure ''blocked process threshold'', 5; /* Seconds of blocking before a report is generated */
 RECONFIGURE;',
@@ -10363,8 +10630,9 @@ IF EXISTS
         1/0
     FROM sys.configurations AS c
     WHERE c.name = N'blocked process threshold (s)'
-    AND   CONVERT(int, c.value_in_use) <> 5
+    AND   CONVERT(integer, c.value_in_use) <> 5
 )
+AND @session_name NOT LIKE N'system%health'
 BEGIN
     RAISERROR(N'For best results, set up the blocked process report like this:
 EXECUTE sys.sp_configure ''show advanced options'', 1;
@@ -10410,7 +10678,10 @@ DECLARE
     @log_database_schema nvarchar(1024),
     @max_event_time datetime2(7),
     @dsql nvarchar(max) = N'',
-    @mdsql nvarchar(max) = N'';
+    @mdsql nvarchar(max) = N'',
+    @actual_start_date datetime2(7),
+    @actual_end_date datetime2(7),
+    @actual_event_count bigint;
 
 /*Use some sane defaults for input parameters*/
 IF @debug = 1
@@ -10513,6 +10784,47 @@ BEGIN
     FROM {table_check};
 END;';
 
+IF @debug = 1
+AND @is_system_health = 0
+BEGIN
+    RAISERROR('We are not using system_health', 0, 1) WITH NOWAIT;
+END;
+
+IF @is_system_health = 1
+BEGIN
+    RAISERROR('For best results, consider not using system_health as your target. Re-run with @help = 1 for guidance.', 0, 1) WITH NOWAIT;
+END
+
+/*
+Note: I do not allow logging to a table from system_health, because the set of columns
+and available data is too incomplete, and I don't want to juggle multiple
+table definitions.
+
+Logging to a table is only allowed from a blocked_process_report Extended Event,
+but it can either be ring buffer or file target. I don't care about that.
+*/
+IF @is_system_health = 1
+AND
+(
+  LOWER(@target_type) = N'table'
+  OR @log_to_table = 1
+)
+BEGIN
+    RAISERROR('Logging system_health to a table is not supported.
+Either pick a different session or change both
+@target_type to be ''event_file'' or ''ring_buffer''
+and @log_to_table to be 0.', 11, 0) WITH NOWAIT;
+    RETURN;
+END
+
+IF  @is_system_health = 1
+AND @target_type IS NULL
+BEGIN
+    RAISERROR('No @target_type specified, using the ''event_file'' for system_health.', 0, 1) WITH NOWAIT;
+    SELECT
+        @target_type = 'event_file';
+END
+
 SELECT
     @azure_msg =
         CONVERT(nchar(1), @azure),
@@ -10524,6 +10836,7 @@ IF  ISNULL(@target_database, DB_NAME()) IS NOT NULL
 AND ISNULL(@target_schema, N'dbo') IS NOT NULL
 AND @target_table IS NOT NULL
 AND @target_column IS NOT NULL
+AND @is_system_health = 0
 BEGIN
     SET @target_type = N'table';
 END;
@@ -10800,22 +11113,22 @@ BEGIN
                 contentious_object nvarchar(4000) NULL,
                 activity varchar(8) NULL,
                 blocking_tree varchar(8000) NULL,
-                spid int NULL,
-                ecid int NULL,
+                spid integer NULL,
+                ecid integer NULL,
                 query_text xml NULL,
                 wait_time_ms bigint NULL,
                 status nvarchar(10) NULL,
                 isolation_level nvarchar(50) NULL,
                 lock_mode nvarchar(10) NULL,
                 resource_owner_type nvarchar(256) NULL,
-                transaction_count int NULL,
+                transaction_count integer NULL,
                 transaction_name nvarchar(1024) NULL,
                 last_transaction_started datetime2(7) NULL,
                 last_transaction_completed datetime2(7) NULL,
                 client_option_1 varchar(261) NULL,
                 client_option_2 varchar(307) NULL,
                 wait_resource nvarchar(1024) NULL,
-                priority int NULL,
+                priority integer NULL,
                 log_used bigint NULL,
                 client_app nvarchar(256) NULL,
                 host_name nvarchar(256) NULL,
@@ -10900,6 +11213,12 @@ CREATE TABLE
     sort_order bigint
 );
 
+CREATE TABLE
+    #sp_server_diagnostics_component_result
+(
+    sp_server_diagnostics_component_result xml
+);
+
 IF LOWER(@target_type) = N'table'
 BEGIN
     GOTO TableMode;
@@ -10964,7 +11283,8 @@ BEGIN
         JOIN sys.dm_xe_session_targets AS t
           ON s.address = t.event_session_address
         WHERE s.name = @session_name
-        ORDER BY t.target_name
+        ORDER BY
+            t.target_name
         OPTION(RECOMPILE);
     END;
 
@@ -10977,14 +11297,17 @@ BEGIN
         JOIN sys.dm_xe_database_session_targets AS t
           ON s.address = t.event_session_address
         WHERE s.name = @session_name
-        ORDER BY t.target_name
+        ORDER BY
+            t.target_name
         OPTION(RECOMPILE);
     END;
 END;
 
-/* Dump whatever we got into a temp table */
+/*
+Dump whatever we got into a temp table
+Note that system_health hits this branch if we use the ring_buffer target.
+*/
 IF  LOWER(@target_type) = N'ring_buffer'
-AND @is_system_health = 0
 BEGIN
     IF @azure = 0
     BEGIN
@@ -11165,11 +11488,19 @@ BEGIN
         human_events_xml
     )
     SELECT
-        human_events_xml = e.x.query('.')
-    FROM #x AS x
-    CROSS APPLY x.x.nodes('/RingBufferTarget/event') AS e(x)
-    WHERE e.x.exist('@name[ .= "blocked_process_report"]') = 1
-    AND   e.x.exist('@timestamp[. >= sql:variable("@start_date") and .< sql:variable("@end_date")]') = 1
+        human_events_xml
+    FROM
+    (
+        SELECT TOP (CASE WHEN @max_blocking_events > 0 THEN @max_blocking_events ELSE 2147483647 END)
+            human_events_xml = e.x.query('.'),
+            event_timestamp = e.x.value('@timestamp', 'datetime2')
+        FROM #x AS x
+        CROSS APPLY x.x.nodes('/RingBufferTarget/event') AS e(x)
+        WHERE e.x.exist('@name[ .= "blocked_process_report"]') = 1
+        AND   e.x.exist('@timestamp[. >= sql:variable("@start_date") and .< sql:variable("@end_date")]') = 1
+        ORDER BY
+            event_timestamp DESC
+    ) AS most_recent
     OPTION(RECOMPILE);
 END;
 
@@ -11189,49 +11520,79 @@ BEGIN
         human_events_xml
     )
     SELECT
-        human_events_xml = e.x.query('.')
-    FROM #x AS x
-    CROSS APPLY x.x.nodes('/event') AS e(x)
-    WHERE e.x.exist('@name[ .= "blocked_process_report"]') = 1
-    AND   e.x.exist('@timestamp[. >= sql:variable("@start_date") and .< sql:variable("@end_date")]') = 1
+        human_events_xml
+    FROM
+    (
+        SELECT TOP (CASE WHEN @max_blocking_events > 0 THEN @max_blocking_events ELSE 2147483647 END)
+            human_events_xml = e.x.query('.'),
+            event_timestamp = e.x.value('@timestamp', 'datetime2')
+        FROM #x AS x
+        CROSS APPLY x.x.nodes('/event') AS e(x)
+        WHERE e.x.exist('@name[ .= "blocked_process_report"]') = 1
+        AND   e.x.exist('@timestamp[. >= sql:variable("@start_date") and .< sql:variable("@end_date")]') = 1
+        ORDER BY
+            event_timestamp DESC
+    ) AS most_recent
     OPTION(RECOMPILE);
 END;
 
 /*
 This section is special for the well-hidden and much less comprehensive blocked
-process report stored in the system health extended event session
+process report stored in the system health extended event session.
 
-Note: I do not allow logging to a table from this, because the set of columns
-and available data is too incomplete, and I don't want to juggle multiple
-table definitions.
-
-Logging to a table is only allowed from the a blocked_process_report Extended Event,
-but it can either be ring buffer or file target. I don't care about that.
+We disallow many features here.
+See where @is_system_health was declared for details.
+That is also where we error out if somebody tries to use an unsupported feature.
 */
 IF  @is_system_health = 1
-AND LOWER(@target_type) <> N'table'
-AND @log_to_table = 0
 BEGIN
     IF @debug = 1
     BEGIN
-        RAISERROR('Inserting to #sp_server_diagnostics_component_result for system health: %s', 0, 1, @is_system_health_msg) WITH NOWAIT;
+        RAISERROR('Inserting to #sp_server_diagnostics_component_result for target type: %s and system health: %s', 0, 1, @target_type, @is_system_health_msg) WITH NOWAIT;
     END;
 
-    SELECT
-        xml.sp_server_diagnostics_component_result
-    INTO #sp_server_diagnostics_component_result
-    FROM
-    (
+    IF @target_type = N'ring_buffer'
+    BEGIN
+        INSERT
+            #sp_server_diagnostics_component_result
+        WITH
+            (TABLOCKX)
+        (
+            sp_server_diagnostics_component_result
+        )
         SELECT
-            sp_server_diagnostics_component_result =
-                TRY_CAST(fx.event_data AS xml)
-        FROM sys.fn_xe_file_target_read_file(N'system_health*.xel', NULL, NULL, NULL) AS fx
-        WHERE fx.object_name = N'sp_server_diagnostics_component_result'
-    ) AS xml
-    CROSS APPLY xml.sp_server_diagnostics_component_result.nodes('/event') AS e(x)
-    WHERE e.x.exist('//data[@name="data"]/value/queryProcessing/blockingTasks/blocked-process-report') = 1
-    AND   e.x.exist('@timestamp[. >= sql:variable("@start_date") and .< sql:variable("@end_date")]') = 1
-    OPTION(RECOMPILE);
+            sp_server_diagnostics_component_result = e.x.query('.')
+        FROM #x AS xml
+        CROSS APPLY xml.x.nodes('/RingBufferTarget/event') AS e(x)
+        WHERE e.x.exist('@name[ .= "sp_server_diagnostics_component_result"]') = 1
+        AND   e.x.exist('//data[@name="data"]/value/queryProcessing/blockingTasks/blocked-process-report') = 1
+        AND   e.x.exist('@timestamp[. >= sql:variable("@start_date") and .< sql:variable("@end_date")]') = 1
+        OPTION(RECOMPILE);
+    END
+    ELSE
+    BEGIN
+        INSERT
+            #sp_server_diagnostics_component_result
+        WITH
+            (TABLOCKX)
+        (
+            sp_server_diagnostics_component_result
+        )
+        SELECT
+            xml.sp_server_diagnostics_component_result
+        FROM
+        (
+            SELECT
+                sp_server_diagnostics_component_result =
+                    TRY_CAST(fx.event_data AS xml)
+            FROM sys.fn_xe_file_target_read_file(N'system_health*.xel', NULL, NULL, NULL) AS fx
+            WHERE fx.object_name = N'sp_server_diagnostics_component_result'
+        ) AS xml
+        CROSS APPLY xml.sp_server_diagnostics_component_result.nodes('/event') AS e(x)
+        WHERE e.x.exist('//data[@name="data"]/value/queryProcessing/blockingTasks/blocked-process-report') = 1
+        AND   e.x.exist('@timestamp[. >= sql:variable("@start_date") and .< sql:variable("@end_date")]') = 1
+        OPTION(RECOMPILE);
+    END;
 
     IF @debug = 1
     BEGIN
@@ -11245,22 +11606,31 @@ BEGIN
     END;
 
     SELECT
-        event_time =
-            DATEADD
-            (
-                MINUTE,
-                DATEDIFF
+        event_time,
+        human_events_xml
+    INTO #blocking_xml_sh
+    FROM
+    (
+        SELECT TOP (CASE WHEN @max_blocking_events > 0 THEN @max_blocking_events ELSE 2147483647 END)
+            event_time =
+                DATEADD
                 (
                     MINUTE,
-                    GETUTCDATE(),
-                    SYSDATETIME()
+                    DATEDIFF
+                    (
+                        MINUTE,
+                        GETUTCDATE(),
+                        SYSDATETIME()
+                    ),
+                    w.x.value('(//@timestamp)[1]', 'datetime2')
                 ),
-                w.x.value('(//@timestamp)[1]', 'datetime2')
-            ),
-        human_events_xml = w.x.query('//data[@name="data"]/value/queryProcessing/blockingTasks/blocked-process-report')
-    INTO #blocking_xml_sh
-    FROM #sp_server_diagnostics_component_result AS wi
-    CROSS APPLY wi.sp_server_diagnostics_component_result.nodes('//event') AS w(x)
+            human_events_xml = w.x.query('//data[@name="data"]/value/queryProcessing/blockingTasks/blocked-process-report'),
+            event_timestamp = w.x.value('(//@timestamp)[1]', 'datetime2')
+        FROM #sp_server_diagnostics_component_result AS wi
+        CROSS APPLY wi.sp_server_diagnostics_component_result.nodes('//event') AS w(x)
+        ORDER BY
+            event_timestamp DESC
+    ) AS most_recent
     OPTION(RECOMPILE);
 
     IF @debug = 1
@@ -11293,7 +11663,7 @@ BEGIN
         isolation_level = bd.value('(process/@isolationlevel)[1]', 'nvarchar(50)'),
         log_used = bd.value('(process/@logused)[1]', 'bigint'),
         clientoption1 = bd.value('(process/@clientoption1)[1]', 'bigint'),
-        clientoption2 = bd.value('(process/@clientoption1)[1]', 'bigint'),
+        clientoption2 = bd.value('(process/@clientoption2)[1]', 'bigint'),
         activity = CASE WHEN bd.exist('//blocked-process-report/blocked-process') = 1 THEN 'blocked' END,
         blocked_process_report = bd.query('.')
     INTO #blocked_sh
@@ -11350,7 +11720,7 @@ BEGIN
         isolation_level = bg.value('(process/@isolationlevel)[1]', 'nvarchar(50)'),
         log_used = bg.value('(process/@logused)[1]', 'bigint'),
         clientoption1 = bg.value('(process/@clientoption1)[1]', 'bigint'),
-        clientoption2 = bg.value('(process/@clientoption1)[1]', 'bigint'),
+        clientoption2 = bg.value('(process/@clientoption2)[1]', 'bigint'),
         activity = CASE WHEN bg.exist('//blocked-process-report/blocking-process') = 1 THEN 'blocking' END,
         blocked_process_report = bg.query('.')
     INTO #blocking_sh
@@ -11910,7 +12280,7 @@ SELECT
     currentdbname = bd.value('(process/@currentdbname)[1]', 'nvarchar(256)'),
     currentdbid = bd.value('(process/@currentdb)[1]', 'integer'),
     blocking_level = 0,
-    sort_order = CAST('' AS varchar(400)),
+    sort_order = CONVERT(varchar(400), ''),
     activity = CASE WHEN oa.c.exist('//blocked-process-report/blocked-process') = 1 THEN 'blocked' END,
     blocked_process_report = c.query('.')
 INTO #blocked
@@ -11948,17 +12318,17 @@ ADD blocking_desc AS
         ISNULL
         (
             '(' +
-            CAST(blocking_spid AS varchar(10)) +
+            CONVERT(varchar(10), blocking_spid) +
             ':' +
-            CAST(blocking_ecid AS varchar(10)) +
+            CONVERT(varchar(10), blocking_ecid) +
             ')',
             'unresolved process'
         ) PERSISTED,
     blocked_desc AS
         '(' +
-        CAST(blocked_spid AS varchar(10)) +
+        CONVERT(varchar(10), blocked_spid) +
         ':' +
-        CAST(blocked_ecid AS varchar(10)) +
+        CONVERT(varchar(10), blocked_ecid) +
         ')' PERSISTED;
 
 IF @debug = 1
@@ -12026,11 +12396,11 @@ SELECT
     isolation_level = bg.value('(process/@isolationlevel)[1]', 'nvarchar(50)'),
     log_used = bg.value('(process/@logused)[1]', 'bigint'),
     clientoption1 = bg.value('(process/@clientoption1)[1]', 'bigint'),
-    clientoption2 = bg.value('(process/@clientoption1)[1]', 'bigint'),
+    clientoption2 = bg.value('(process/@clientoption2)[1]', 'bigint'),
     currentdbname = bg.value('(process/@currentdbname)[1]', 'nvarchar(128)'),
     currentdbid = bg.value('(process/@currentdb)[1]', 'integer'),
     blocking_level = 0,
-    sort_order = CAST('' AS varchar(400)),
+    sort_order = CONVERT(varchar(400), ''),
     activity = CASE WHEN oa.c.exist('//blocked-process-report/blocking-process') = 1 THEN 'blocking' END,
     blocked_process_report = c.query('.')
 INTO #blocking
@@ -12068,17 +12438,17 @@ ADD blocking_desc AS
         ISNULL
         (
             '(' +
-            CAST(blocking_spid AS varchar(10)) +
+            CONVERT(varchar(10), blocking_spid) +
             ':' +
-            CAST(blocking_ecid AS varchar(10)) +
+            CONVERT(varchar(10), blocking_ecid) +
             ')',
             'unresolved process'
         ) PERSISTED,
     blocked_desc AS
         '(' +
-        CAST(blocked_spid AS varchar(10)) +
+        CONVERT(varchar(10), blocked_spid) +
         ':' +
-        CAST(blocked_ecid AS varchar(10)) +
+        CONVERT(varchar(10), blocked_ecid) +
         ')' PERSISTED;
 
 IF @debug = 1
@@ -12116,11 +12486,12 @@ WITH
         blocked_desc,
         level = 0,
         sort_order =
-            CAST
+            CONVERT
             (
+                varchar(400),
                 blocking_desc +
                 ' </* ' +
-                blocked_desc AS varchar(400)
+                blocked_desc
             )
     FROM #blocking AS b
     WHERE NOT EXISTS
@@ -12140,13 +12511,14 @@ WITH
         bg.blocked_desc,
         h.level + 1,
         sort_order =
-            CAST
+            CONVERT
             (
+                varchar(400),
                 h.sort_order +
                 ' ' +
                 bg.blocking_desc +
                 ' </* ' +
-                bg.blocked_desc AS varchar(400)
+                bg.blocked_desc
             )
     FROM hierarchy AS h
     JOIN #blocking AS bg
@@ -12833,6 +13205,20 @@ BEGIN
         ap.avg_worker_time_ms DESC
     OPTION(RECOMPILE, LOOP JOIN, HASH JOIN);
 
+    /* Capture actual date range and event count from the data */
+    SELECT
+        @actual_start_date = MIN(event_time),
+        @actual_end_date = MAX(event_time),
+        @actual_event_count = COUNT_BIG(DISTINCT monitor_loop)
+    FROM #blocked
+    WHERE event_time IS NOT NULL;
+
+    /* Use original dates if no data found */
+    SELECT
+        @actual_start_date = ISNULL(@actual_start_date, @start_date_original),
+        @actual_end_date = ISNULL(@actual_end_date, @end_date_original),
+        @actual_event_count = ISNULL(@actual_event_count, 0);
+
     IF @debug = 1
     BEGIN
         RAISERROR('Inserting #block_findings, check_id -1', 0, 1) WITH NOWAIT;
@@ -12851,9 +13237,27 @@ BEGIN
     SELECT
         check_id = -1,
         database_name = N'erikdarling.com',
-        object_name = N'sp_HumanEventsBlockViewer version ' + CONVERT(nvarchar(30), @version) + N'.',
+        object_name =
+            N'sp_HumanEventsBlockViewer version ' +
+            CONVERT(nvarchar(30), @version) +
+            N'.',
         finding_group = N'https://code.erikdarling.com',
-        finding = N'blocking for period ' + CONVERT(nvarchar(30), @start_date_original, 126) + N' through ' + CONVERT(nvarchar(30), @end_date_original, 126) + N'.',
+        finding =
+            N'blocking events from ' +
+            CONVERT(nvarchar(30), @actual_start_date, 126) +
+            N' to ' +
+            CONVERT(nvarchar(30), @actual_end_date, 126) +
+            N' (' + CONVERT(nvarchar(30), @actual_event_count) +
+            N' total events' +
+            CASE
+                WHEN @max_blocking_events > 0
+                AND  @actual_event_count >= @max_blocking_events
+                THEN N', limited to most recent ' +
+                     CONVERT(nvarchar(30), @max_blocking_events) +
+                     N')'
+                ELSE N')'
+            END +
+            N'.',
         1;
 
     IF @debug = 1
@@ -13682,7 +14086,9 @@ BEGIN
     SELECT
         check_id = 2147483647,
         database_name = N'erikdarling.com',
-        object_name = N'sp_HumanEventsBlockViewer version ' + CONVERT(nvarchar(30), @version) + N'.',
+        object_name =
+            N'sp_HumanEventsBlockViewer version ' +
+            CONVERT(nvarchar(30), @version) + N'.',
         finding_group = N'https://code.erikdarling.com',
         finding = N'thanks for using me!',
         2147483647;
@@ -13757,8 +14163,8 @@ ALTER PROCEDURE
     dbo.sp_IndexCleanup
 (
     @database_name sysname = NULL, /*focus on a single database*/
-    @schema_name sysname = NULL, /*use when focusing on a single table, or to a single schema with no table name*/
-    @table_name sysname = NULL, /*use when focusing on a single table*/
+    @schema_name sysname = NULL, /*use when focusing on a single table/view, or to a single schema with no table name*/
+    @table_name sysname = NULL, /*use when focusing on a single table or view*/
     @min_reads bigint = 0, /*only look at indexes with a minimum number of reads*/
     @min_writes bigint = 0, /*only look at indexes with a minimum number of writes*/
     @min_size_gb decimal(10,2) = 0, /*only look at indexes with a minimum size*/
@@ -13778,8 +14184,8 @@ BEGIN
 SET NOCOUNT ON;
 BEGIN TRY
     SELECT
-        @version = '1.4.4',
-        @version_date = '20250404';
+        @version = '1.6',
+        @version_date = '20250601';
 
     IF
     /* Check SQL Server 2012+ for FORMAT and CONCAT functions */
@@ -13845,7 +14251,7 @@ BEGIN TRY
                     ap.name
                     WHEN N'@database_name' THEN 'the name of the database you wish to analyze'
                     WHEN N'@schema_name' THEN 'limits analysis to tables in the specified schema when used without @table_name'
-                    WHEN N'@table_name' THEN 'the table name to filter indexes by, requires @schema_name if not dbo'
+                    WHEN N'@table_name' THEN 'the table or view name to filter indexes by, requires @schema_name if not dbo'
                     WHEN N'@min_reads' THEN 'minimum number of reads for an index to be considered used'
                     WHEN N'@min_writes' THEN 'minimum number of writes for an index to be considered used'
                     WHEN N'@min_size_gb' THEN 'minimum size in GB for an index to be analyzed'
@@ -13865,7 +14271,7 @@ BEGIN TRY
                     ap.name
                     WHEN N'@database_name' THEN 'the name of a database you care about indexes in'
                     WHEN N'@schema_name' THEN 'schema name or NULL for all schemas'
-                    WHEN N'@table_name' THEN 'table name or NULL for all tables'
+                    WHEN N'@table_name' THEN 'table (or view) name or NULL for all tables'
                     WHEN N'@min_reads' THEN 'any positive integer or 0'
                     WHEN N'@min_writes' THEN 'any positive integer or 0'
                     WHEN N'@min_size_gb' THEN 'any positive decimal or 0'
@@ -14144,7 +14550,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         index_id integer NOT NULL,
         index_name sysname NOT NULL,
         can_compress bit NOT NULL
-        PRIMARY KEY CLUSTERED(database_id, schema_id, object_id, index_id)
+        INDEX filtered_objects CLUSTERED
+            (database_id, schema_id, object_id, index_id)
     );
 
     CREATE TABLE
@@ -14188,7 +14595,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         page_io_latch_wait_in_ms bigint NULL,
         page_compression_attempt_count bigint NULL,
         page_compression_success_count bigint NULL,
-        PRIMARY KEY CLUSTERED (database_id, schema_id, object_id, index_id)
+        PRIMARY KEY CLUSTERED
+            (database_id, schema_id, object_id, index_id)
     );
 
     CREATE TABLE
@@ -14212,7 +14620,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         built_on sysname NULL,
         partition_function_name sysname NULL,
         partition_columns nvarchar(max)
-        PRIMARY KEY CLUSTERED(database_id, schema_id, object_id, index_id, partition_id)
+        PRIMARY KEY CLUSTERED
+            (database_id, schema_id, object_id, index_id, partition_id)
     );
 
     CREATE TABLE
@@ -14250,7 +14659,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         last_user_lookup datetime NULL,
         last_user_update datetime NULL,
         is_eligible_for_dedupe bit NOT NULL
-        PRIMARY KEY CLUSTERED(database_id, schema_id, object_id, index_id, column_id)
+        PRIMARY KEY CLUSTERED
+            (database_id, schema_id, object_id, index_id, column_id)
     );
 
     CREATE TABLE
@@ -14286,7 +14696,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         superseded_by nvarchar(4000) NULL,
         /* Priority score from 0-1 to determine which index to keep (higher is better) */
         index_priority decimal(10,6) NULL
-        PRIMARY KEY CLUSTERED(database_id, schema_id, object_id, index_id)
+        INDEX index_analysis CLUSTERED
+            (database_id, schema_id, object_id, index_id)
     );
 
     CREATE TABLE
@@ -14302,7 +14713,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         index_name sysname NOT NULL,
         can_compress bit NOT NULL,
         reason nvarchar(200) NULL,
-        PRIMARY KEY CLUSTERED(database_id, schema_id, object_id, index_id)
+        PRIMARY KEY CLUSTERED
+            (database_id, schema_id, object_id, index_id, can_compress)
     );
 
     CREATE TABLE
@@ -14410,26 +14822,26 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     CREATE TABLE
         #include_databases
     (
-        database_name sysname NOT NULL PRIMARY KEY
+        database_name sysname NOT NULL PRIMARY KEY CLUSTERED
     );
 
     CREATE TABLE
         #exclude_databases
     (
-        database_name sysname NOT NULL PRIMARY KEY
+        database_name sysname NOT NULL PRIMARY KEY CLUSTERED
     );
 
     CREATE TABLE
         #databases
     (
-        database_name sysname NOT NULL PRIMARY KEY,
+        database_name sysname NOT NULL PRIMARY KEY CLUSTERED,
         database_id int NOT NULL
     );
 
     CREATE TABLE
         #requested_but_skipped_databases
     (
-        database_name sysname NOT NULL PRIMARY KEY,
+        database_name sysname NOT NULL PRIMARY KEY CLUSTERED,
         reason nvarchar(100) NOT NULL
     );
 
@@ -14447,7 +14859,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         definition nvarchar(max) NULL,
         contains_udf bit NOT NULL,
         udf_names nvarchar(max) NULL,
-        PRIMARY KEY CLUSTERED(database_id, schema_id, object_id, column_id)
+        PRIMARY KEY CLUSTERED
+            (database_id, schema_id, object_id, column_id)
     );
 
     CREATE TABLE
@@ -14464,7 +14877,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         definition nvarchar(max) NULL,
         contains_udf bit NOT NULL,
         udf_names nvarchar(max) NULL,
-        PRIMARY KEY CLUSTERED(database_id, schema_id, object_id, constraint_id)
+        PRIMARY KEY CLUSTERED
+            (database_id, schema_id, object_id, constraint_id)
     );
 
     CREATE TABLE
@@ -14481,7 +14895,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         filter_definition nvarchar(max) NULL,
         missing_included_columns nvarchar(max) NULL,
         should_include_filter_columns bit NOT NULL,
-        INDEX c CLUSTERED(database_id, schema_id, object_id, index_id)
+        INDEX c CLUSTERED
+            (database_id, schema_id, object_id, index_id)
     );
 
     /* Parse @include_databases comma-separated list */
@@ -14875,12 +15290,12 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         SELECT DISTINCT
             @database_id,
             database_name = DB_NAME(@database_id),
-            schema_id = t.schema_id,
+            schema_id = s.schema_id,
             schema_name = s.name,
-            object_id = t.object_id,
-            table_name = t.name,
+            object_id = i.object_id,
+            table_name = ISNULL(t.name, v.name),
             index_id = i.index_id,
-            index_name = ISNULL(i.name, t.name + N''.Heap''),
+            index_name = ISNULL(i.name, ISNULL(t.name, v.name) + N''.Heap''),
             can_compress =
                 CASE
                     WHEN p.index_id > 0
@@ -14888,26 +15303,21 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                     THEN 1
                     ELSE 0
                 END
-        FROM ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
+        FROM ' + QUOTENAME(@current_database_name) + N'.sys.indexes AS i
+        LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
+          ON i.object_id = t.object_id
+        LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.views AS v
+          ON i.object_id = v.object_id
         JOIN ' + QUOTENAME(@current_database_name) + N'.sys.schemas AS s
-          ON t.schema_id = s.schema_id
-        JOIN ' + QUOTENAME(@current_database_name) + N'.sys.indexes AS i
-          ON t.object_id = i.object_id
+          ON ISNULL(t.schema_id, v.schema_id) = s.schema_id
         JOIN ' + QUOTENAME(@current_database_name) + N'.sys.partitions AS p
           ON  i.object_id = p.object_id
           AND i.index_id = p.index_id
         LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.dm_db_index_usage_stats AS us
-          ON  t.object_id = us.object_id
+          ON  i.object_id = us.object_id
           AND us.database_id = @database_id
-        WHERE t.is_ms_shipped = 0
-        AND   t.type <> N''TF''
-        AND   NOT EXISTS
-        (
-            SELECT
-                1/0
-            FROM ' + QUOTENAME(@current_database_name) + N'.sys.views AS v
-            WHERE v.object_id = i.object_id
-        )
+        WHERE (t.object_id IS NULL OR t.is_ms_shipped = 0)
+        AND   (t.object_id IS NULL OR t.type <> N''TF'')
         AND i.is_disabled = 0
         AND i.is_hypothetical = 0';
 
@@ -14958,7 +15368,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         END;
 
         SET @sql += N'
-        AND   t.object_id = @object_id';
+        AND   i.object_id = @object_id';
     END;
 
     IF  @schema_name IS NOT NULL
@@ -14981,7 +15391,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             FROM ' + QUOTENAME(@current_database_name) + N'.sys.dm_db_partition_stats AS ps
             JOIN ' + QUOTENAME(@current_database_name) + N'.sys.allocation_units AS au
               ON ps.partition_id = au.container_id
-            WHERE ps.object_id = t.object_id
+            WHERE ps.object_id = i.object_id
             GROUP BY
                 ps.object_id
             HAVING
@@ -14992,7 +15402,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             SELECT
                 1/0
             FROM ' + QUOTENAME(@current_database_name) + N'.sys.dm_db_partition_stats AS ps
-            WHERE ps.object_id = t.object_id
+            WHERE ps.object_id = i.object_id
             AND   ps.index_id IN (0, 1)
             GROUP BY
                 ps.object_id
@@ -15004,7 +15414,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             SELECT
                 1/0
             FROM ' + QUOTENAME(@current_database_name) + N'.sys.dm_db_index_usage_stats AS ius
-            WHERE ius.object_id = t.object_id
+            WHERE ius.object_id = i.object_id
             AND   ius.database_id = @database_id
             GROUP BY
                 ius.object_id
@@ -15413,9 +15823,9 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         schema_id = s.schema_id,
         schema_name = s.name,
         os.object_id,
-        table_name = t.name,
+        table_name = ISNULL(t.name, v.name),
         os.index_id,
-        index_name = ISNULL(i.name, t.name + N''.Heap''),
+        index_name = ISNULL(i.name, ISNULL(t.name, v.name) + N''.Heap''),
         range_scan_count = SUM(os.range_scan_count),
         singleton_lookup_count = SUM(os.singleton_lookup_count),
         forwarded_fetch_count = SUM(os.forwarded_fetch_count),
@@ -15453,10 +15863,12 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         NULL,
         NULL
     ) AS os
-    JOIN ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
+    LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
       ON os.object_id = t.object_id
+    LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.views AS v
+      ON os.object_id = v.object_id
     JOIN ' + QUOTENAME(@current_database_name) + N'.sys.schemas AS s
-      ON t.schema_id = s.schema_id
+      ON ISNULL(t.schema_id, v.schema_id) = s.schema_id
     JOIN ' + QUOTENAME(@current_database_name) + N'.sys.indexes AS i
       ON  os.object_id = i.object_id
       AND os.index_id = i.index_id
@@ -15474,7 +15886,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         s.schema_id,
         s.name,
         os.object_id,
-        t.name,
+        ISNULL(t.name, v.name),
         os.index_id,
         i.name
     OPTION(RECOMPILE);
@@ -15564,12 +15976,12 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     SELECT
         database_id = @database_id,
         database_name = DB_NAME(@database_id),
-        t.object_id,
+        i.object_id,
         i.index_id,
         s.schema_id,
         schema_name = s.name,
-        table_name = t.name,
-        index_name = ISNULL(i.name, t.name + N''.Heap''),
+        table_name = ISNULL(t.name, v.name),
+        index_name = ISNULL(i.name, ISNULL(t.name, v.name) + N''.Heap''),
         column_name = c.name,
         column_id = c.column_id,
         i.is_primary_key,
@@ -15661,11 +16073,13 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                 )
                 THEN 0
             END
-    FROM ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
+    FROM ' + QUOTENAME(@current_database_name) + N'.sys.indexes AS i
+    LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
+      ON i.object_id = t.object_id
+    LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.views AS v
+      ON i.object_id = v.object_id
     JOIN ' + QUOTENAME(@current_database_name) + N'.sys.schemas AS s
-      ON t.schema_id = s.schema_id
-    JOIN ' + QUOTENAME(@current_database_name) + N'.sys.indexes AS i
-      ON t.object_id = i.object_id
+      ON ISNULL(t.schema_id, v.schema_id) = s.schema_id
     JOIN ' + QUOTENAME(@current_database_name) + N'.sys.index_columns AS ic
       ON  i.object_id = ic.object_id
       AND i.index_id = ic.index_id
@@ -15680,7 +16094,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       ON  i.object_id = us.object_id
       AND i.index_id = us.index_id
       AND us.database_id = @database_id
-    WHERE t.is_ms_shipped = 0
+    WHERE (t.object_id IS NULL OR t.is_ms_shipped = 0)
     AND   i.type IN (1, 2)
     AND   i.is_disabled = 0
     AND   i.is_hypothetical = 0
@@ -15690,7 +16104,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             1/0
         FROM #filtered_objects AS fo
         WHERE fo.database_id = @database_id
-        AND   fo.object_id = t.object_id
+        AND   fo.object_id = i.object_id
     )
     AND   EXISTS
     (
@@ -15702,7 +16116,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         (
             nvarchar(MAX),
             N'.sys.dm_db_partition_stats ps
-        WHERE ps.object_id = t.object_id
+        WHERE ps.object_id = i.object_id
         AND   ps.index_id = 1
         AND   ps.row_count >= @min_rows
     )'
@@ -15716,7 +16130,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         END;
 
         SELECT @sql += N'
-    AND   t.object_id = @object_id';
+    AND   i.object_id = @object_id';
     END;
 
     SELECT
@@ -15845,8 +16259,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             ps.index_id,
             s.schema_id,
             schema_name = s.name,
-            table_name = t.name,
-            index_name = ISNULL(i.name, t.name + N''.Heap''),
+            table_name = ISNULL(t.name, v.name),
+            index_name = ISNULL(i.name, ISNULL(t.name, v.name) + N''.Heap''),
             ps.partition_id,
             p.partition_number,
             total_rows = ps.row_count,
@@ -15855,11 +16269,13 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             reserved_row_overflow_gb = SUM(ps.row_overflow_reserved_page_count) * 8. / 1024. / 1024.0, /* Convert directly to GB */
             p.data_compression_desc,
             i.data_space_id
-        FROM ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
-        JOIN ' + QUOTENAME(@current_database_name) + N'.sys.indexes AS i
-          ON t.object_id = i.object_id
+        FROM ' + QUOTENAME(@current_database_name) + N'.sys.indexes AS i
+        LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.tables AS t
+          ON i.object_id = t.object_id
+        LEFT JOIN ' + QUOTENAME(@current_database_name) + N'.sys.views AS v
+          ON i.object_id = v.object_id
         JOIN ' + QUOTENAME(@current_database_name) + N'.sys.schemas AS s
-          ON t.schema_id = s.schema_id
+          ON ISNULL(t.schema_id, v.schema_id) = s.schema_id
         JOIN ' + QUOTENAME(@current_database_name) + N'.sys.partitions AS p
           ON  i.object_id = p.object_id
           AND i.index_id = p.index_id
@@ -15867,7 +16283,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
           ON p.partition_id = a.container_id
         LEFT HASH JOIN ' + QUOTENAME(@current_database_name) + N'.sys.dm_db_partition_stats AS ps
           ON p.partition_id = ps.partition_id
-        WHERE t.type <> N''TF''
+        WHERE (t.object_id IS NULL OR t.type <> N''TF'')
         AND   i.type IN (1, 2)
         AND   EXISTS
         (
@@ -15875,7 +16291,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                 1/0
             FROM #filtered_objects AS fo
             WHERE fo.database_id = @database_id
-            AND   fo.object_id = t.object_id
+            AND   fo.object_id = i.object_id
         )';
 
     IF @object_id IS NOT NULL
@@ -15886,7 +16302,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         END;
 
         SELECT @sql += N'
-        AND   t.object_id = @object_id';
+        AND   i.object_id = @object_id';
     END;
 
     SELECT
@@ -15896,7 +16312,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             ps.index_id,
             s.schema_id,
             s.name,
-            t.name,
+            ISNULL(t.name, v.name),
             i.name,
             ps.partition_id,
             p.partition_number,
@@ -16243,6 +16659,86 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     END;
 
     /* Analyze filtered indexes to identify columns used in filters that should be included */
+    SET @sql = N'
+    SELECT DISTINCT
+        ia.database_id,
+        ia.database_name,
+        ia.schema_id,
+        ia.schema_name,
+        ia.object_id,
+        ia.table_name,
+        ia.index_id,
+        ia.index_name,
+        ia.filter_definition,
+        missing_included_columns =
+            (
+                SELECT
+                    STUFF
+                    (
+                        (
+                            /* Find column names mentioned in filter_definition that aren''t already key or included columns */
+                            SELECT
+                                N'', '' +
+                                c.name
+                            FROM ' + QUOTENAME(@current_database_name) + N'.sys.columns AS c
+                            WHERE c.object_id = ia.object_id
+                            AND   ia.filter_definition LIKE N''%'' + c.name + N''%'' COLLATE DATABASE_DEFAULT
+                            AND   NOT EXISTS
+                            (
+                                SELECT
+                                    1/0
+                                FROM #index_details AS id
+                                WHERE id.object_id = ia.object_id
+                                AND   id.index_id = ia.index_id
+                                AND   id.column_id = c.column_id
+                            )
+                            GROUP BY
+                                c.name
+                            FOR
+                                XML
+                                PATH(''''),
+                                TYPE
+                        ).value(''text()[1]'',''nvarchar(max)''),
+                        1,
+                        2,
+                        N''''
+                    )
+            ),
+        should_include_filter_columns =
+            CASE
+                WHEN EXISTS
+                (
+                    /* Check if any columns mentioned in filter_definition aren''t already in the index */
+                    SELECT
+                        1/0
+                    FROM ' + QUOTENAME(@current_database_name) + N'.sys.columns AS c
+                    WHERE c.object_id = ia.object_id
+                    AND   ia.filter_definition LIKE N''%'' + c.name + N''%'' COLLATE DATABASE_DEFAULT
+                    AND   NOT EXISTS
+                    (
+                        SELECT
+                            1/0
+                        FROM #index_details AS id
+                        WHERE id.object_id = ia.object_id
+                        AND   id.index_id = ia.index_id
+                        AND   id.column_id = c.column_id
+                    )
+                )
+                THEN 1
+                ELSE 0
+            END
+    FROM #index_analysis AS ia
+    WHERE ia.filter_definition IS NOT NULL
+    AND   ia.database_id = @current_database_id
+    OPTION(RECOMPILE);';
+
+    IF @debug = 1
+    BEGIN
+        RAISERROR('Filtered index analysis SQL:', 0, 1) WITH NOWAIT;
+        PRINT @sql;
+    END;
+
+    /* The correct pattern: INSERT ... EXECUTE */
     INSERT INTO
         #filtered_index_columns_analysis
     WITH
@@ -16260,76 +16756,10 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         missing_included_columns,
         should_include_filter_columns
     )
-    SELECT DISTINCT
-        ia.database_id,
-        ia.database_name,
-        ia.schema_id,
-        ia.schema_name,
-        ia.object_id,
-        ia.table_name,
-        ia.index_id,
-        ia.index_name,
-        ia.filter_definition,
-        missing_included_columns =
-            (
-                SELECT
-                    STUFF
-                    (
-                        (
-                            /* Find column names mentioned in filter_definition that aren't already key or included columns */
-                            SELECT
-                                N', ' +
-                                c.name
-                            FROM sys.columns AS c
-                            WHERE c.object_id = ia.object_id
-                            AND   ia.filter_definition LIKE N'%[[]' + c.name + N'[]]%'
-                            AND   NOT EXISTS
-                            (
-                                SELECT
-                                    1/0
-                                FROM #index_details AS id
-                                WHERE id.object_id = ia.object_id
-                                AND   id.index_id = ia.index_id
-                                AND   id.column_id = c.column_id
-                            )
-                            GROUP BY
-                                c.name
-                            FOR
-                                XML
-                                PATH(''),
-                                TYPE
-                        ).value('text()[1]','nvarchar(max)'),
-                        1,
-                        2,
-                        N''
-                    )
-            ),
-        should_include_filter_columns =
-            CASE
-                WHEN EXISTS
-                (
-                    /* Check if any columns mentioned in filter_definition aren't already in the index */
-                    SELECT
-                        1/0
-                    FROM sys.columns AS c
-                    WHERE c.object_id = ia.object_id
-                    AND   ia.filter_definition LIKE N'%[[]' + c.name + N'[]]%'
-                    AND   NOT EXISTS
-                    (
-                        SELECT
-                            1/0
-                        FROM #index_details AS id
-                        WHERE id.object_id = ia.object_id
-                        AND   id.index_id = ia.index_id
-                        AND   id.column_id = c.column_id
-                    )
-                )
-                THEN 1
-                ELSE 0
-            END
-    FROM #index_analysis AS ia
-    WHERE ia.filter_definition IS NOT NULL
-    OPTION(RECOMPILE);
+    EXECUTE sys.sp_executesql
+        @sql,
+      N'@current_database_id integer',
+        @current_database_id;
 
     IF @debug = 1
     BEGIN
@@ -20114,30 +20544,6 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         irs.table_name
     OPTION(RECOMPILE);
 
-    /* Check for databases that were processed but had no objects to analyze */
-    WITH empty_databases AS
-    (
-        SELECT
-            database_name
-        FROM #databases AS d
-        WHERE NOT EXISTS
-        (
-            SELECT
-                1/0
-            FROM #index_reporting_stats AS irs
-            WHERE irs.database_name = d.database_name
-        )
-    )
-
-    SELECT
-        finding_type = 'DATABASES WITH NO QUALIFYING OBJECTS',
-        database_name = d.database_name + N' - Nothing Found',
-        recommendation = 'Database was processed but no objects met the analysis criteria'
-    FROM empty_databases AS d
-    ORDER BY
-        d.database_name
-    OPTION(RECOMPILE);
-
     /* Output message for dedupe_only mode */
     IF @dedupe_only = 1
     BEGIN
@@ -20215,15 +20621,60 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             fica.table_name,
             fica.index_name,
             fica.filter_definition,
+            ia.original_index_definition,
             fica.missing_included_columns,
             recommendation = 'Add filter columns to INCLUDE list to improve performance and avoid key lookups'
         FROM #filtered_index_columns_analysis AS fica
+        JOIN #index_analysis AS ia
+          ON  ia.database_id = fica.database_id
+          AND ia.schema_id = fica.schema_id
+          AND ia.object_id = fica.object_id
+          AND ia.index_id = fica.index_id
         WHERE fica.should_include_filter_columns = 1
         ORDER BY
             fica.database_name,
             fica.schema_name,
             fica.table_name,
             fica.index_name;
+    END;
+
+    /* Check for databases that were processed but had no objects to analyze */
+    IF EXISTS
+    (
+        SELECT
+            1/0
+        FROM #databases AS d
+        WHERE NOT EXISTS
+        (
+            SELECT
+                1/0
+            FROM #index_reporting_stats AS irs
+            WHERE irs.database_name = d.database_name
+        )
+    )
+    BEGIN
+        WITH
+            empty_databases AS
+        (
+            SELECT
+                database_name
+            FROM #databases AS d
+            WHERE NOT EXISTS
+            (
+                SELECT
+                    1/0
+                FROM #index_reporting_stats AS irs
+                WHERE irs.database_name = d.database_name
+            )
+        )
+        SELECT
+            finding_type = 'DATABASES WITH NO QUALIFYING OBJECTS',
+            database_name = d.database_name + N' - Nothing Found',
+            recommendation = 'Database was processed but no objects met the analysis criteria'
+        FROM empty_databases AS d
+        ORDER BY
+            database_name
+        OPTION(RECOMPILE);
     END;
 
 END TRY
@@ -20306,8 +20757,8 @@ SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 BEGIN
     SELECT
-        @version = '2.4.4',
-        @version_date = '20250404';
+        @version = '2.6',
+        @version_date = '20250601';
 
     IF @help = 1
     BEGIN
@@ -21036,8 +21487,8 @@ BEGIN
     Set version information
     */
     SELECT
-        @version = N'1.0.4',
-        @version_date = N'20250404';
+        @version = N'1.6',
+        @version_date = N'20250601';
 
     /*
     Help section, for help.
@@ -21283,7 +21734,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         @io_sql nvarchar(max) = N'',
         @file_io_sql nvarchar(max) = N'',
         @db_size_sql nvarchar(max) = N'',
-        @tempdb_files_sql nvarchar(max) = N'';
+        @tempdb_files_sql nvarchar(max) = N'',
+        /* TempDB pagelatch contention variables */
+        @pagelatch_wait_hours decimal(20,2),
+        @server_uptime_hours decimal(20,2),
+        @pagelatch_ratio_to_uptime decimal(10,4);
 
 
     /* Check for VIEW SERVER STATE permission */
@@ -21899,7 +22354,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         url
     )
     SELECT
-        check_id = 4103,
+        check_id = 5103,
         priority =
             CASE
                 WHEN
@@ -22312,8 +22767,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                 50,
                 N'Default Trace Permissions',
                 N'Inadequate permissions',
-                NULL,
-                NULL,
+                N'N/A',
+                N'System Trace',
                 N'Access to sys.traces is only available to accounts with elevated privileges, or when explicitly granted',
                 N'GRANT ALTER TRACE TO ' +
                 SUSER_NAME() +
@@ -22955,6 +23410,30 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         AND   ws.wait_type <> N'SLEEP_TASK'
         ORDER BY
             ws.wait_time_percent_of_uptime DESC;
+    END;
+
+    /* Calculate pagelatch wait time for TempDB contention check */
+    IF @has_view_server_state = 1
+    BEGIN
+        SELECT
+            @pagelatch_wait_hours =
+                SUM
+                (
+                    CASE
+                        WHEN osw.wait_type IN (N'PAGELATCH_UP', N'PAGELATCH_SH', N'PAGELATCH_EX')
+                        THEN osw.wait_time_ms / 1000.0 / 3600.0
+                        ELSE 0
+                    END
+                ),
+            @server_uptime_hours =
+                DATEDIFF(SECOND, osi.sqlserver_start_time, GETDATE()) / 3600.0
+        FROM sys.dm_os_wait_stats AS osw
+        CROSS JOIN sys.dm_os_sys_info AS osi
+        GROUP BY
+            DATEDIFF(SECOND, osi.sqlserver_start_time, GETDATE()) / 3600.0;
+
+        SET @pagelatch_ratio_to_uptime =
+            @pagelatch_wait_hours / NULLIF(@server_uptime_hours, 0) * 100;
     END;
 
     /* Check for CPU scheduling pressure (signal wait ratio) */
@@ -24056,9 +24535,9 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             OR (c.name = N'access check cache quota' AND c.value_in_use <> 0)
             OR (c.name = N'Ad Hoc Distributed Queries' AND c.value_in_use <> 0)
             /* ADR settings */
-            OR (c.name = N'ADR cleaner retry timeout (min)' AND c.value_in_use NOT IN (15, 120))
+            OR (c.name = N'ADR cleaner retry timeout (min)' AND c.value_in_use NOT IN (0, 15, 120))
             OR (c.name = N'ADR Cleaner Thread Count' AND c.value_in_use <> 1)
-            OR (c.name = N'ADR Preallocation Factor' AND c.value_in_use <> 4)
+            OR (c.name = N'ADR Preallocation Factor' AND c.value_in_use NOT IN (0, 4))
             /* Affinity settings */
             OR (c.name = N'affinity mask' AND c.value_in_use <> 0)
             OR (c.name = N'affinity I/O mask' AND c.value_in_use <> 0)
@@ -24256,8 +24735,12 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                 50, /* High priority */
                 N'TempDB Configuration',
                 N'Single TempDB Data File',
-                N'TempDB has only one data file. Multiple files can reduce allocation page contention. ' +
-                N'Recommendation: Use multiple files (equal to number of logical processors up to 8).',
+                N'TempDB has only one data file on a ' + CONVERT(nvarchar(10), @processors) +
+                N'-core system. This creates allocation contention. Recommendation: Add ' +
+                CASE
+                    WHEN @processors > 8 THEN N'8'
+                    ELSE CONVERT(nvarchar(10), @processors)
+                END + N' data files total.',
                 N'https://erikdarling.com/sp_PerfCheck#tempdb'
             );
         END;
@@ -24396,6 +24879,43 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                 N'TempDB data files are using percentage growth settings. This can lead to increasingly larger growth events as files grow. ' +
                 N'TempDB is recreated on server restart, so using predictable fixed-size growth is recommended for better performance.',
                 N'https://erikdarling.com/sp_PerfCheck#tempdb'
+            );
+        END;
+
+        /* Check for TempDB allocation contention based on pagelatch waits */
+        IF  @tempdb_data_file_count <= @processors
+        AND @tempdb_data_file_count < 8
+        AND @has_view_server_state = 1
+        AND @pagelatch_ratio_to_uptime >= 1.0
+        BEGIN
+            INSERT INTO
+                #results
+            (
+                check_id,
+                priority,
+                category,
+                finding,
+                details,
+                url
+            )
+            VALUES
+            (
+                2010,
+                40, /* High priority */
+                N'TempDB Performance',
+                N'TempDB Allocation Contention Detected',
+                N'Server has spent ' +
+                CONVERT(nvarchar(20), CONVERT(decimal(10,2), @pagelatch_wait_hours)) +
+                N' hours (' +
+                CONVERT(nvarchar(10), CONVERT(decimal(5,2), @pagelatch_ratio_to_uptime)) +
+                N'% of uptime) waiting on page latches. TempDB has ' +
+                CONVERT(nvarchar(10), @tempdb_data_file_count) +
+                N' data files. Consider adding files up to ' +
+                CASE
+                    WHEN @processors > 8 THEN N'8'
+                    ELSE CONVERT(nvarchar(10), @processors)
+                END + N' total to reduce allocation contention.',
+                N'https://erikdarling.com/sp_PerfCheck#tempdb-contention'
             );
         END;
 
@@ -25278,7 +25798,51 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             url = N'https://erikdarling.com/sp_PerfCheck#QueryStore'
         FROM #databases AS d
         WHERE d.database_id = @current_database_id
-        AND   d.is_query_store_on = 0;
+        AND   d.is_query_store_on = 0
+        /* Skip this check for Azure SQL DB since Query Store is typically always enabled
+           and Azure might be reporting is_query_store_on incorrectly */
+        AND   @azure_sql_db = 0;
+
+        /* For Azure SQL DB, explicitly check Query Store status since is_query_store_on might be incorrect */
+        IF @azure_sql_db = 1
+        BEGIN
+            SET @sql = N'
+            SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+            SELECT
+                check_id = 7006,
+                priority = 60, /* Informational priority */
+                category = N''Database Configuration'',
+                finding = N''Query Store Not Enabled'',
+                database_name = @current_database_name,
+                details = N''Query Store is not enabled.
+                          Consider enabling Query Store to track query performance
+                          over time and identify regression issues.'',
+                url = N''https://erikdarling.com/sp_PerfCheck#QueryStore''
+            FROM ' + QUOTENAME(@current_database_name) + N'.sys.database_query_store_options AS qso
+            WHERE qso.actual_state = 0 /* OFF */;';
+
+            IF @debug = 1
+            BEGIN
+                PRINT @sql;
+            END;
+
+            INSERT INTO
+                #results
+            (
+                check_id,
+                priority,
+                category,
+                finding,
+                database_name,
+                details,
+                url
+            )
+            EXECUTE sys.sp_executesql
+                @sql,
+              N'@current_database_name sysname',
+                @current_database_name;
+        END;
 
         /* Check for Query Store in problematic state */
         BEGIN TRY
@@ -26030,8 +26594,8 @@ SET XACT_ABORT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 SELECT
-    @version = '5.4.4',
-    @version_date = '20250404';
+    @version = '5.6',
+    @version_date = '20250601';
 
 
 IF @help = 1
@@ -26049,7 +26613,7 @@ BEGIN
     SELECT ' * wait stats relevant to cpu, memory, and disk pressure, along with query performance' UNION ALL
     SELECT ' * how many worker threads and how much memory you have available' UNION ALL
     SELECT ' * running queries that are using cpu and memory' UNION ALL
-    SELECT 'from your loving sql server consultant, erik darling: https://erikdarling.com';
+    SELECT 'from https://erikdarling.com';
 
     /*
     Parameters
@@ -26508,8 +27072,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
                 (
                     id bigint IDENTITY,
                     collection_time datetime2(7) NOT NULL DEFAULT SYSDATETIME(),
-                    hours_uptime integer NULL,
-                    hours_cpu_time decimal(38,2) NULL,
+                    server_hours_uptime integer NULL,
+                    server_hours_cpu_time decimal(38,2) NULL,
                     wait_type nvarchar(60) NOT NULL,
                     description nvarchar(60) NULL,
                     hours_wait_time decimal(38,2) NULL,
@@ -26546,7 +27110,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                 (
                     id bigint IDENTITY,
                     collection_time datetime2(7) NOT NULL DEFAULT SYSDATETIME(),
-                    hours_uptime integer NULL,
+                    server_hours_uptime integer NULL,
                     drive nvarchar(255) NOT NULL,
                     database_name nvarchar(128) NOT NULL,
                     database_file_details nvarchar(1000) NULL,
@@ -26954,8 +27518,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
     DECLARE
         @waits table
     (
-        hours_uptime integer,
-        hours_cpu_time decimal(38,2),
+        server_hours_uptime integer,
+        server_hours_cpu_time decimal(38,2),
         wait_type nvarchar(60),
         description nvarchar(60),
         hours_wait_time decimal(38,2),
@@ -26985,7 +27549,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
     DECLARE
         @file_metrics table
     (
-        hours_uptime integer,
+        server_hours_uptime integer,
         drive nvarchar(255),
         database_name nvarchar(128),
         database_file_details nvarchar(1000),
@@ -27113,8 +27677,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
         INSERT
             @waits
         (
-            hours_uptime,
-            hours_cpu_time,
+            server_hours_uptime,
+            server_hours_cpu_time,
             wait_type,
             description,
             hours_wait_time,
@@ -27125,7 +27689,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
             sorting
         )
         SELECT
-            hours_uptime =
+            server_hours_uptime =
                 (
                     SELECT
                         DATEDIFF
@@ -27136,7 +27700,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                         )
                     FROM sys.dm_os_sys_info AS osi
                 ),
-            hours_cpu_time =
+            server_hours_cpu_time =
                 (
                     SELECT
                         CONVERT
@@ -27349,9 +27913,9 @@ OPTION(MAXDOP 1, RECOMPILE);',
                      /*Stats/Compilation*/
                      N'WAIT_ON_SYNC_STATISTICS_REFRESH',
                      /*Throttling*/
-                    N'IO_QUEUE_LIMIT',
-                    N'IO_RETRY',
-                    N'RESMGR_THROTTLED'
+                     N'IO_QUEUE_LIMIT',
+                     N'IO_RETRY',
+                     N'RESMGR_THROTTLED'
                  )
             /*Locking*/
             OR dows.wait_type LIKE N'LCK%'
@@ -27368,8 +27932,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
                 SELECT
                     w.wait_type,
                     w.description,
-                    w.hours_uptime,
-                    w.hours_cpu_time,
+                    w.server_hours_uptime,
+                    w.server_hours_cpu_time,
                     w.hours_wait_time,
                     w.avg_ms_per_wait,
                     w.percent_signal_waits,
@@ -27409,7 +27973,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                         CONVERT
                         (
                             decimal(38,2),
-                            (w2.hours_cpu_time - w.hours_cpu_time) / 1000.
+                            (w2.server_hours_cpu_time - w.server_hours_cpu_time) / 1000.
                         ),
                     wait_time_seconds =
                         CONVERT
@@ -27476,8 +28040,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
                     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
                     INSERT INTO ' + @log_table_waits + N'
                     (
-                        hours_uptime,
-                        hours_cpu_time,
+                        server_hours_uptime,
+                        server_hours_cpu_time,
                         wait_type,
                         description,
                         hours_wait_time,
@@ -27486,8 +28050,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
                         waiting_tasks_count
                     )
                     SELECT
-                        w.hours_uptime,
-                        w.hours_cpu_time,
+                        w.server_hours_uptime,
+                        w.server_hours_cpu_time,
                         w.wait_type,
                         w.description,
                         w.hours_wait_time,
@@ -27525,7 +28089,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
         SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
         SELECT
-            hours_uptime =
+            server_hours_uptime =
                 (
                     SELECT
                         DATEDIFF
@@ -27714,7 +28278,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
         INSERT
             @file_metrics
         (
-            hours_uptime,
+            server_hours_uptime,
             drive,
             database_name,
             database_file_details,
@@ -27742,7 +28306,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                     file_metrics AS
                 (
                     SELECT
-                        fm.hours_uptime,
+                        fm.server_hours_uptime,
                         fm.drive,
                         fm.database_name,
                         fm.database_file_details,
@@ -27794,7 +28358,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                     fm.drive,
                     fm.database_name,
                     fm.database_file_details,
-                    fm.hours_uptime,
+                    fm.server_hours_uptime,
                     fm.file_size_gb,
                     fm.avg_read_stall_ms,
                     fm.avg_write_stall_ms,
@@ -27811,7 +28375,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                     drive = N'Nothing to see here',
                     database_name = N'By default, only >100 ms latency is reported',
                     database_file_details = N'Use the @minimum_disk_latency_ms parameter to adjust what you see',
-                    hours_uptime = 0,
+                    server_hours_uptime = 0,
                     file_size_gb = 0,
                     avg_read_stall_ms = 0,
                     avg_write_stall_ms = 0,
@@ -28011,7 +28575,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
                INSERT INTO ' + @log_table_file_metrics + N'
                (
-                   hours_uptime,
+                   server_hours_uptime,
                    drive,
                    database_name,
                    database_file_details,
@@ -28028,7 +28592,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                    io_stall_write_ms
                )
                SELECT
-                   fm.hours_uptime,
+                   fm.server_hours_uptime,
                    fm.drive,
                    fm.database_name,
                    fm.database_file_details,
@@ -28150,7 +28714,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                     p AS
                 (
                     SELECT
-                        hours_uptime =
+                        server_hours_uptime =
                             (
                                 SELECT
                                     DATEDIFF
@@ -28184,7 +28748,7 @@ OPTION(MAXDOP 1, RECOMPILE);',
                     p.object_name,
                     p.counter_name,
                     p.instance_name,
-                    p.hours_uptime,
+                    p.server_hours_uptime,
                     p.total,
                     p.total_per_second
                 FROM p
@@ -29110,60 +29674,19 @@ OPTION(MAXDOP 1, RECOMPILE);',
             database_name =
                 DB_NAME(deqp.dbid),
             [dd hh:mm:ss.mss] =
-                RIGHT
-                (
-                    ''00'' +
-                    CONVERT
-                    (
-                        varchar(10),
-                        DATEDIFF
-                        (
-                            DAY,
-                            deqmg.request_time,
-                            SYSDATETIME()
-                        )
-                    ),
-                    2
-                ) +
-                '' '' +
-                CONVERT
-                (
-                    varchar(20),
-                    CASE
-                        WHEN
-                            DATEDIFF
-                            (
-                                DAY,
-                                deqmg.request_time,
-                                SYSDATETIME()
-                            ) >= 24
-                        THEN
-                            DATEADD
-                            (
-                                SECOND,
-                                DATEDIFF
-                                (
-                                    SECOND,
-                                    deqmg.request_time,
-                                    SYSDATETIME()
-                                ),
-                                ''19000101''
-                            )
-                        ELSE
-                            DATEADD
-                            (
-                                MILLISECOND,
-                                DATEDIFF
-                                (
-                                    MILLISECOND,
-                                    deqmg.request_time,
-                                    SYSDATETIME()
-                                ),
-                                ''19000101''
-                            )
-                        END,
-                        14
-                ),
+                CASE
+                    WHEN e.elapsed_time_ms < 0
+                    THEN RIGHT(REPLICATE(''0'', 2) + CONVERT(varchar(10), (-1 * e.elapsed_time_ms) / 86400), 2) +
+                         '' '' +
+                         RIGHT(CONVERT(varchar(30), DATEADD(second, (-1 * e.elapsed_time_ms), 0), 120), 9) +
+                         ''.000''
+                    ELSE RIGHT(REPLICATE(''0'', 2) +
+                         CONVERT(varchar(10), e.elapsed_time_ms / 86400000), 2) +
+                         '' '' +
+                         RIGHT(convert(varchar(30), DATEADD(second, e.elapsed_time_ms / 1000, 0), 120), 9) +
+                         ''.'' +
+                         RIGHT(''000'' + CONVERT(varchar(3), e.elapsed_time_ms % 1000), 3)
+                END,
             query_text =
                 (
                     SELECT
@@ -29264,6 +29787,16 @@ OPTION(MAXDOP 1, RECOMPILE);',
         FROM sys.dm_exec_query_memory_grants AS deqmg
         LEFT JOIN sys.dm_exec_requests AS der
           ON der.session_id = deqmg.session_id
+        OUTER APPLY
+        (
+            SELECT
+                elapsed_time_ms =
+                    CASE
+                        WHEN DATEDIFF(HOUR, der.start_time, SYSDATETIME()) > 576
+                        THEN DATEDIFF(SECOND, SYSDATETIME(), der.start_time)
+                        ELSE DATEDIFF(MILLISECOND, der.start_time, SYSDATETIME())
+                    END
+        ) AS e
         OUTER APPLY
         (
             SELECT TOP (1)
@@ -29660,14 +30193,14 @@ OPTION(MAXDOP 1, RECOMPILE);',
                         (
                             decimal(38,2),
                             (
-                                x.runnable / (1. * NULLIF(x.total, 0))
+                                x.runnable /
+                                (1. * NULLIF(x.total, 0))
                             )
                         ) * 100.
                 FROM
                 (
                     SELECT
-                        total =
-                            COUNT_BIG(*),
+                        total = COUNT_BIG(*),
                         runnable =
                             SUM
                             (
@@ -29679,6 +30212,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
                             )
                     FROM sys.dm_exec_requests AS der
                     WHERE der.session_id > 50
+                    AND   der.session_id <> @@SPID
+                    AND   der.status NOT IN (N''background'', N''sleeping'')
                 ) AS x
             ) AS y
             WHERE y.runnable_pct >= 10
@@ -29690,6 +30225,11 @@ OPTION(MAXDOP 1, RECOMPILE);',
 
         IF @log_to_table = 0
         BEGIN
+            IF @debug = 1
+            BEGIN
+                PRINT @cpu_threads;
+            END;
+
             EXECUTE sys.sp_executesql
                 @cpu_threads;
         END;
@@ -29798,60 +30338,19 @@ OPTION(MAXDOP 1, RECOMPILE);',
                 database_name =
                     DB_NAME(der.database_id),
                 [dd hh:mm:ss.mss] =
-                    RIGHT
-                    (
-                        ''00'' +
-                        CONVERT
-                        (
-                            varchar(10),
-                            DATEDIFF
-                            (
-                                DAY,
-                                der.start_time,
-                                SYSDATETIME()
-                            )
-                        ),
-                        2
-                    ) +
-                    '' '' +
-                    CONVERT
-                    (
-                        varchar(20),
-                        CASE
-                            WHEN
-                                DATEDIFF
-                                (
-                                    DAY,
-                                    der.start_time,
-                                    SYSDATETIME()
-                                ) >= 24
-                            THEN
-                                DATEADD
-                                (
-                                    SECOND,
-                                    DATEDIFF
-                                    (
-                                        SECOND,
-                                        der.start_time,
-                                        SYSDATETIME()
-                                    ),
-                                    ''19000101''
-                                )
-                            ELSE
-                                DATEADD
-                                (
-                                    MILLISECOND,
-                                    DATEDIFF
-                                    (
-                                        MILLISECOND,
-                                        der.start_time,
-                                        SYSDATETIME()
-                                    ),
-                                    ''19000101''
-                                )
-                            END,
-                            14
-                    ),
+                    CASE
+                        WHEN e.elapsed_time_ms < 0
+                        THEN RIGHT(REPLICATE(''0'', 2) + CONVERT(varchar(10), (-1 * e.elapsed_time_ms) / 86400), 2) +
+                             '' '' +
+                             RIGHT(CONVERT(varchar(30), DATEADD(second, (-1 * e.elapsed_time_ms), 0), 120), 9) +
+                             ''.000''
+                        ELSE RIGHT(REPLICATE(''0'', 2) +
+                             CONVERT(varchar(10), e.elapsed_time_ms / 86400000), 2) +
+                             '' '' +
+                             RIGHT(convert(varchar(30), DATEADD(second, e.elapsed_time_ms / 1000, 0), 120), 9) +
+                             ''.'' +
+                             RIGHT(''000'' + CONVERT(varchar(3), e.elapsed_time_ms % 1000), 3)
+                    END,
                 query_text =
                     (
                         SELECT
@@ -30001,6 +30500,16 @@ OPTION(MAXDOP 1, RECOMPILE);',
                       nvarchar(max),
                       N'
             FROM sys.dm_exec_requests AS der
+            OUTER APPLY
+            (
+                SELECT
+                    elapsed_time_ms =
+                        CASE
+                            WHEN DATEDIFF(HOUR, der.start_time, SYSDATETIME()) > 576
+                            THEN DATEDIFF(SECOND, SYSDATETIME(), der.start_time)
+                            ELSE DATEDIFF(MILLISECOND, der.start_time, SYSDATETIME())
+                        END
+            ) AS e
             OUTER APPLY sys.dm_exec_sql_text(der.plan_handle) AS dest
             OUTER APPLY sys.dm_exec_text_query_plan
             (
@@ -30369,7 +30878,7 @@ ALTER PROCEDURE
     @query_type varchar(11) = NULL, /*filter for only ad hoc queries or only from queries from modules*/
     @expert_mode bit = 0, /*returns additional columns and results*/
     @hide_help_table bit = 0, /*hides the "bottom table" that shows help and support information*/
-    @format_output bit = 1, /*returns numbers formatted with commas*/
+    @format_output bit = 1, /*returns numbers formatted with commas and most decimals rounded away*/
     @get_all_databases bit = 0, /*looks for query store enabled user databases and returns combined results from all of them*/
     @include_databases nvarchar(max) = NULL, /*comma-separated list of databases to include (only when @get_all_databases = 1)*/
     @exclude_databases nvarchar(max) = NULL, /*comma-separated list of databases to exclude (only when @get_all_databases = 1)*/
@@ -30421,8 +30930,8 @@ END;
 These are for your outputs.
 */
 SELECT
-    @version = '5.4.4',
-    @version_date = '20250404';
+    @version = '5.6',
+    @version_date = '20250601';
 
 /*
 Helpful section! For help.
@@ -30485,7 +30994,7 @@ BEGIN
                 WHEN N'@query_type' THEN 'filter for only ad hoc queries or only from queries from modules'
                 WHEN N'@expert_mode' THEN 'returns additional columns and results'
                 WHEN N'@hide_help_table' THEN 'hides the "bottom table" that shows help and support information'
-                WHEN N'@format_output' THEN 'returns numbers formatted with commas'
+                WHEN N'@format_output' THEN 'returns numbers formatted with commas and most decimals rounded away'
                 WHEN N'@get_all_databases' THEN 'looks for query store enabled user databases and returns combined results from all of them'
                 WHEN N'@include_databases' THEN 'comma-separated list of databases to include (only when @get_all_databases = 1)'
                 WHEN N'@exclude_databases' THEN 'comma-separated list of databases to exclude (only when @get_all_databases = 1)'
@@ -30723,6 +31232,222 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     RETURN;
 END; /*End @help section*/
 
+
+/*
+Validate Sort Order.
+We do this super early on, because we care about it even
+when populating the tables that we declare very soon.
+*/
+IF @sort_order NOT IN
+   (
+       'cpu',
+       'logical reads',
+       'physical reads',
+       'writes',
+       'duration',
+       'memory',
+       'tempdb',
+       'executions',
+       'recent',
+       'plan count by hashes',
+       'cpu waits',
+       'lock waits',
+       'locks waits',
+       'latch waits',
+       'latches waits',
+       'buffer latch waits',
+       'buffer latches waits',
+       'buffer io waits',
+       'log waits',
+       'log io waits',
+       'network waits',
+       'network io waits',
+       'parallel waits',
+       'parallelism waits',
+       'memory waits',
+       'total waits',
+       'rows'
+   )
+BEGIN
+   RAISERROR('The sort order (%s) you chose is so out of this world that I''m using cpu instead', 10, 1, @sort_order) WITH NOWAIT;
+
+   SELECT
+       @sort_order = 'cpu';
+END;
+
+DECLARE
+    @sort_order_is_a_wait bit;
+
+/*
+Checks if the sort order is for a wait.
+Cuts out a lot of repetition.
+*/
+IF LOWER(@sort_order) IN
+   (
+       'cpu waits',
+       'lock waits',
+       'locks waits',
+       'latch waits',
+       'latches waits',
+       'buffer latch waits',
+       'buffer latches waits',
+       'buffer io waits',
+       'log waits',
+       'log io waits',
+       'network waits',
+       'network io waits',
+       'parallel waits',
+       'parallelism waits',
+       'memory waits',
+       'total waits'
+   )
+BEGIN
+   SELECT
+       @sort_order_is_a_wait = 1;
+END;
+
+/*
+We also validate regression mode super early.
+We need to do this here so we can build @ColumnDefinitions correctly.
+It also lets us fail fast, if needed.
+*/
+DECLARE
+    @regression_mode bit;
+
+/*
+Set @regression_mode if the given arguments indicate that
+we are checking for regressed queries.
+Also set any default parameters for regression mode while we're at it.
+*/
+IF @regression_baseline_start_date IS NOT NULL
+BEGIN
+    SELECT
+        @regression_mode = 1,
+        @regression_comparator =
+            ISNULL(@regression_comparator, 'absolute'),
+        @regression_direction =
+            ISNULL(@regression_direction, 'regressed');
+END;
+
+/*
+Error out if the @regression parameters do not make sense.
+*/
+IF
+(
+  @regression_baseline_start_date IS NULL
+  AND
+  (
+      @regression_baseline_end_date IS NOT NULL
+   OR @regression_comparator IS NOT NULL
+   OR @regression_direction IS NOT NULL
+  )
+)
+BEGIN
+    RAISERROR('@regression_baseline_start_date is mandatory if you have specified any other @regression_ parameter.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Error out if the @regression_baseline_start_date and
+@regression_baseline_end_date are incompatible.
+We could try and guess a sensible resolution, but
+I do not think that we can know what people want.
+*/
+IF
+(
+    @regression_baseline_start_date IS NOT NULL
+AND @regression_baseline_end_date IS NOT NULL
+AND @regression_baseline_start_date >= @regression_baseline_end_date
+)
+BEGIN
+    RAISERROR('@regression_baseline_start_date has been set greater than or equal to @regression_baseline_end_date.
+This does not make sense. Check that the values of both parameters are as you intended them to be.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Validate @regression_comparator.
+*/
+IF
+(
+    @regression_comparator IS NOT NULL
+AND @regression_comparator NOT IN ('relative', 'absolute')
+)
+BEGIN
+   RAISERROR('The regression_comparator (%s) you chose is so out of this world that I''m using ''absolute'' instead', 10, 1, @regression_comparator) WITH NOWAIT;
+
+   SELECT
+       @regression_comparator = 'absolute';
+END;
+
+/*
+Validate @regression_direction.
+*/
+IF
+(
+    @regression_direction IS NOT NULL
+AND @regression_direction NOT IN ('regressed', 'worse', 'improved', 'better', 'magnitude', 'absolute')
+)
+BEGIN
+   RAISERROR('The regression_direction (%s) you chose is so out of this world that I''m using ''regressed'' instead', 10, 1, @regression_direction) WITH NOWAIT;
+
+   SELECT
+       @regression_direction = 'regressed';
+END;
+
+/*
+Error out if we're trying to do regression mode with 'recent'
+as our @sort_order. How could that ever make sense?
+*/
+IF
+(
+    @regression_mode = 1
+AND @sort_order = 'recent'
+)
+BEGIN
+    RAISERROR('Your @sort_order is ''recent'', but you are trying to compare metrics for two time periods.
+If you can imagine a useful way to do that, then make a feature request.
+Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Error out if we're trying to do regression mode with 'plan count by hashes'
+as our @sort_order. How could that ever make sense?
+*/
+IF
+(
+    @regression_mode = 1
+AND @sort_order = 'plan count by hashes'
+)
+BEGIN
+    RAISERROR('Your @sort_order is ''plan count by hashes'', but you are trying to compare metrics for two time periods.
+This is probably not useful, since our method of comparing two time period relies on only checking query hashes that are in both time periods.
+If you can imagine a useful way to do that, then make a feature request.
+Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Error out if @regression_comparator tells us to use division,
+but @regression_direction tells us to take the modulus.
+It doesn't make sense to specifically ask us to remove the sign
+of something that doesn't care about it.
+*/
+IF
+(
+    @regression_comparator = 'relative'
+AND @regression_direction IN ('absolute', 'magnitude')
+)
+BEGIN
+    RAISERROR('Your @regression_comparator is ''relative'', but you have asked for an ''absolute'' or ''magnitude'' @regression_direction. This is probably a mistake.
+Your @regression_direction tells us to take the absolute value of our result of comparing the metrics in the current time period to the baseline time period,
+but your @regression_comparator is telling us to use division to compare the two time periods. This is unlikely to produce useful results.
+If you can imagine a useful way to do that, then make a feature request. Otherwise, either change @regression_direction to another value
+(e.g. ''better'' or ''worse'') or change @regression_comparator to ''absolute''.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
 /*
 These are the tables that we'll use to grab data from query store
 It will be fun
@@ -30818,6 +31543,16 @@ CREATE TABLE
             1
         ) PERSISTED NOT NULL
           PRIMARY KEY CLUSTERED
+);
+
+/*
+For filtering by @execution_count.
+This is only used for filtering, so it only needs one column.
+*/
+CREATE TABLE
+    #plan_ids_having_enough_executions
+(
+    plan_id bigint PRIMARY KEY CLUSTERED,
 );
 
 /*
@@ -31536,7 +32271,7 @@ CREATE TABLE
     id bigint IDENTITY PRIMARY KEY CLUSTERED,
     current_table nvarchar(100) NOT NULL,
     start_time datetime NOT NULL,
-    end_time datetime NOT NULL,
+    end_time datetime NULL,
     runtime_ms AS
         FORMAT
         (
@@ -31732,24 +32467,25 @@ BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES
-        (1600, 'sort_order', 'plan_hash_count', 'plan_hash_count_for_query_hash', 'hashes.plan_hash_count_for_query_hash', 0, NULL, NULL, 0, 'N0'),
-        (1610, 'sort_order', 'query_hash', 'query_hash_from_hash_counting', 'hashes.query_hash', 0, NULL, NULL, 0, NULL);
+        /* 230, so just before avg_query_duration_ms. */
+        (230, 'sort_order', 'query_hash', 'query_hash_from_hash_counting', 'hashes.query_hash', 0, NULL, NULL, 0, NULL),
+        (231, 'sort_order', 'plan_hash_count', 'plan_hash_count_for_query_hash', 'hashes.plan_hash_count_for_query_hash', 0, NULL, NULL, 0, 'N0');
 END;
 
 /* Dynamic regression change column based on formatting and comparator */
-IF @regression_baseline_start_date IS NOT NULL AND @regression_comparator = 'relative' AND @format_output = 1
+IF @regression_mode = 1 AND @regression_comparator = 'relative' AND @format_output = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES (160, 'regression', 'change', 'change_in_average_for_query_hash_since_regression_time_period', 'regression.change_since_regression_time_period', 1, 'regression_mode', 1, 0, 'P2');
 END;
-ELSE IF @regression_baseline_start_date IS NOT NULL AND @format_output = 1
+ELSE IF @regression_mode = 1 AND @format_output = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES (160, 'regression', 'change', 'change_in_average_for_query_hash_since_regression_time_period', 'regression.change_since_regression_time_period', 1, 'regression_mode', 1, 0, 'N2');
 END;
-ELSE IF @regression_baseline_start_date IS NOT NULL
+ELSE IF @regression_mode = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
@@ -31757,12 +32493,13 @@ BEGIN
 END;
 
 /* Wait time for wait-based sorting */
-IF LOWER(@sort_order) LIKE N'%waits'
+IF @sort_order_is_a_wait = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES
-        (1620, 'sort_order', 'wait_time', 'total_wait_time_from_sort_order_ms', 'waits.total_query_wait_time_ms', 0, NULL, NULL, 0, 'N0');
+        /* 240, so just before avg_query_duration_ms. */
+        (240, 'sort_order', 'wait_time', 'total_wait_time_from_sort_order_ms', 'waits.total_query_wait_time_ms', 0, NULL, NULL, 0, 'N0');
 END;
 
 /* ROW_NUMBER window function for sorting */
@@ -31775,7 +32512,7 @@ VALUES
         'n',
         'n',
         'ROW_NUMBER() OVER (PARTITION BY qsrs.plan_id ORDER BY ' +
-        CASE WHEN @regression_baseline_start_date IS NOT NULL THEN
+        CASE WHEN @regression_mode = 1 THEN
              /* As seen when populating #regression_changes */
              CASE @regression_direction
                   WHEN 'regressed' THEN 'regression.change_since_regression_time_period'
@@ -31798,8 +32535,8 @@ VALUES
                  WHEN 'recent' THEN 'qsrs.last_execution_time'
                  WHEN 'rows' THEN 'qsrs.avg_rowcount'
                  WHEN 'plan count by hashes' THEN 'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
-                 ELSE CASE WHEN LOWER(@sort_order) LIKE N'%waits' THEN 'waits.total_query_wait_time_ms'
-                 ELSE 'qsrs.avg_cpu_time' END
+                 ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN 'waits.total_query_wait_time_ms'
+                 ELSE 'qsrs.avg_cpu_time_ms' END
             END
         END + ' DESC)',
         0,
@@ -31931,7 +32668,6 @@ DECLARE
     @queries_top bigint,
     @nc10 nvarchar(2),
     @where_clause nvarchar(max),
-    @having_clause nvarchar(max),
     @query_text_search_original_value nvarchar(4000),
     @query_text_search_not_original_value nvarchar(4000),
     @procedure_exists bit,
@@ -31956,10 +32692,8 @@ DECLARE
     @df integer,
     @work_start_utc time(0),
     @work_end_utc time(0),
-    @sort_order_is_a_wait bit,
     @regression_baseline_start_date_original datetimeoffset(7),
     @regression_baseline_end_date_original datetimeoffset(7),
-    @regression_mode bit,
     @regression_where_clause nvarchar(max),
     @column_sql nvarchar(max),
     @param_name nvarchar(100),
@@ -32041,138 +32775,6 @@ SELECT
                 )
             )
         );
-
-/*
-Set @regression_mode if the given arguments indicate that
-we are checking for regressed queries.
-*/
-IF @regression_baseline_start_date IS NOT NULL
-BEGIN
-    SELECT
-        @regression_mode = 1;
-END;
-
-/*
-Error out if the @regression parameters do not make sense.
-*/
-IF
-(
-  @regression_baseline_start_date IS NULL
-  AND
-  (
-      @regression_baseline_end_date IS NOT NULL
-   OR @regression_comparator IS NOT NULL
-   OR @regression_direction IS NOT NULL
-  )
-)
-BEGIN
-    RAISERROR('@regression_baseline_start_date is mandatory if you have specified any other @regression_ parameter.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-/*
-Error out if the @regression_baseline_start_date and
-@regression_baseline_end_date are incompatible.
-We could try and guess a sensible resolution, but
-I do not think that we can know what people want.
-*/
-IF
-(
-    @regression_baseline_start_date IS NOT NULL
-AND @regression_baseline_end_date IS NOT NULL
-AND @regression_baseline_start_date >= @regression_baseline_end_date
-)
-BEGIN
-    RAISERROR('@regression_baseline_start_date has been set greater than or equal to @regression_baseline_end_date.
-This does not make sense. Check that the values of both parameters are as you intended them to be.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-
-/*
-Validate @regression_comparator.
-*/
-IF
-(
-    @regression_comparator IS NOT NULL
-AND @regression_comparator NOT IN ('relative', 'absolute')
-)
-BEGIN
-   RAISERROR('The regression_comparator (%s) you chose is so out of this world that I''m using ''absolute'' instead', 10, 1, @regression_comparator) WITH NOWAIT;
-
-   SELECT
-       @regression_comparator = 'absolute';
-END;
-
-/*
-Validate @regression_direction.
-*/
-IF
-(
-    @regression_direction IS NOT NULL
-AND @regression_direction NOT IN ('regressed', 'worse', 'improved', 'better', 'magnitude', 'absolute')
-)
-BEGIN
-   RAISERROR('The regression_direction (%s) you chose is so out of this world that I''m using ''regressed'' instead', 10, 1, @regression_direction) WITH NOWAIT;
-
-   SELECT
-       @regression_direction = 'regressed';
-END;
-
-/*
-Error out if we're trying to do regression mode with 'recent'
-as our @sort_order. How could that ever make sense?
-*/
-IF
-(
-    @regression_mode = 1
-AND @sort_order = 'recent'
-)
-BEGIN
-    RAISERROR('Your @sort_order is ''recent'', but you are trying to compare metrics for two time periods.
-If you can imagine a useful way to do that, then make a feature request.
-Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-/*
-Error out if we're trying to do regression mode with 'plan count by hashes'
-as our @sort_order. How could that ever make sense?
-*/
-IF
-(
-    @regression_mode = 1
-AND @sort_order = 'plan count by hashes'
-)
-BEGIN
-    RAISERROR('Your @sort_order is ''plan count by hashes'', but you are trying to compare metrics for two time periods.
-This is probably not useful, since our method of comparing two time period relies on only checking query hashes that are in both time periods.
-If you can imagine a useful way to do that, then make a feature request.
-Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-
-/*
-Error out if @regression_comparator tells us to use division,
-but @regression_direction tells us to take the modulus.
-It doesn't make sense to specifically ask us to remove the sign
-of something that doesn't care about it.
-*/
-IF
-(
-    @regression_comparator = 'relative'
-AND @regression_direction IN ('absolute', 'magnitude')
-)
-BEGIN
-    RAISERROR('Your @regression_comparator is ''relative'', but you have asked for an ''absolute'' or ''magnitude'' @regression_direction. This is probably a mistake.
-Your @regression_direction tells us to take the absolute value of our result of comparing the metrics in the current time period to the baseline time period,
-but your @regression_comparator is telling us to use division to compare the two time periods. This is unlikely to produce useful results.
-If you can imagine a useful way to do that, then make a feature request. Otherwise, either change @regression_direction to another value
-(e.g. ''better'' or ''worse'') or change @regression_comparator to ''absolute''.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
 
 /*
 Set the _original variables, as we have
@@ -32619,6 +33221,9 @@ TRUNCATE TABLE
     #forced_plans_failures;
 
 TRUNCATE TABLE
+    #plan_ids_having_enough_executions;
+
+TRUNCATE TABLE
     #include_plan_ids;
 
 TRUNCATE TABLE
@@ -32755,7 +33360,6 @@ SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;',
         9223372036854775807,
     @nc10 = NCHAR(10),
     @where_clause = N'',
-    @having_clause = N'',
     @query_text_search =
         CASE
             WHEN @get_all_databases = 1
@@ -33086,7 +33690,6 @@ END;
 
 /*
 As above, but for @regression_baseline_start_date and @regression_baseline_end_date.
-We set the other @regression_ variables while we're at it.
 */
 IF @regression_mode = 1
 BEGIN
@@ -33107,11 +33710,7 @@ We set both _date_original variables earlier.
                 MINUTE,
                 @utc_minutes_difference,
                 @regression_baseline_end_date_original
-            ),
-        @regression_comparator =
-            ISNULL(@regression_comparator, 'absolute'),
-        @regression_direction =
-            ISNULL(@regression_direction, 'regressed');
+            );
 END;
 
 /*
@@ -33675,74 +34274,6 @@ BEGIN
 END;
 
 /*
-Validate Sort Order
-*/
-IF @sort_order NOT IN
-   (
-       'cpu',
-       'logical reads',
-       'physical reads',
-       'writes',
-       'duration',
-       'memory',
-       'tempdb',
-       'executions',
-       'recent',
-       'plan count by hashes',
-       'cpu waits',
-       'lock waits',
-       'locks waits',
-       'latch waits',
-       'latches waits',
-       'buffer latch waits',
-       'buffer latches waits',
-       'buffer io waits',
-       'log waits',
-       'log io waits',
-       'network waits',
-       'network io waits',
-       'parallel waits',
-       'parallelism waits',
-       'memory waits',
-       'total waits',
-       'rows'
-   )
-BEGIN
-   RAISERROR('The sort order (%s) you chose is so out of this world that I''m using cpu instead', 10, 1, @sort_order) WITH NOWAIT;
-
-   SELECT
-       @sort_order = 'cpu';
-END;
-
-/*
-Checks if the sort order is for a wait.
-Cuts out a lot of repetition.
-*/
-IF LOWER(@sort_order) IN
-   (
-       'cpu waits',
-       'lock waits',
-       'locks waits',
-       'latch waits',
-       'latches waits',
-       'buffer latch waits',
-       'buffer latches waits',
-       'buffer io waits',
-       'log waits',
-       'log io waits',
-       'network waits',
-       'network io waits',
-       'parallel waits',
-       'parallelism waits',
-       'memory waits',
-       'total waits'
-   )
-BEGIN
-   SELECT
-       @sort_order_is_a_wait = 1;
-END;
-
-/*
 See if our cool new 2022 views exist.
 May have to tweak this if views aren't present in some cloudy situations.
 */
@@ -33858,12 +34389,47 @@ BEGIN
 END;
 
 /*
-One last check: wait stat capture can be enabled or disabled in settings
+These columns are only available in 2017+.
+This is an instance-level check.
+We do it before the database-level checks because the relevant DMVs may not exist on old versions.
+@wait_filter has already been checked.
 */
 IF
 (
-   @wait_filter IS NOT NULL
-OR @new = 1
+  (
+      @sort_order = 'tempdb'
+   OR @sort_order_is_a_wait = 1
+  )
+  AND
+  (
+      @new = 0
+  )
+)
+BEGIN
+   RAISERROR('The sort order (%s) you chose is invalid in product version %i, reverting to sorting by cpu.', 10, 1, @sort_order, @product_version) WITH NOWAIT;
+
+   SELECT
+       @sort_order = N'cpu',
+       @sort_order_is_a_wait = 0;
+
+   DELETE
+   FROM @ColumnDefinitions
+   WHERE metric_type IN (N'wait_time', N'top waits');
+
+   UPDATE
+       @ColumnDefinitions
+   SET
+       column_source = N'ROW_NUMBER() OVER (PARTITION BY qsrs.plan_id ORDER BY qsrs.avg_cpu_time_ms DESC)'
+   WHERE metric_type = N'n';
+END;
+
+/*
+Wait stat capture can be enabled or disabled in settings.
+This is a database-level check.
+*/
+IF
+(
+  @new = 1
 )
 BEGIN
     SELECT
@@ -33925,36 +34491,70 @@ OPTION(RECOMPILE);' + @nc10;
             @sql,
             @current_table;
     END;
-
-    IF @query_store_waits_enabled = 0
-    BEGIN
-        IF @debug = 1
-        BEGIN
-            RAISERROR('Query Store wait stats are not enabled for database %s', 10, 1, @database_name_quoted) WITH NOWAIT;
-        END;
-    END;
-END; /*End wait stats checks*/
+END;
 
 /*
-These columns are only available in 2017+
+To avoid mixing sort orders in the @get_all_databases = 1 case, we skip the
+database if something wait related is requested on a database that does not capture waits.
+
+There is an edge case.
+If you have capturing wait stats disabled, your database can still hold wait stats.
+This happens if you turned capturing off after having it on.
+We make no attempt to handle this.
+Instead, we assume that anyone with capturing wait stats turned off does not want to see them.
 */
 IF
 (
   (
-      @sort_order = 'tempdb'
+      @wait_filter IS NOT NULL
    OR @sort_order_is_a_wait = 1
   )
   AND
   (
-       @new = 0
-    OR @query_store_waits_enabled = 0
+      @query_store_waits_enabled = 0
   )
 )
 BEGIN
-   RAISERROR('The sort order (%s) you chose is invalid in product version %i, reverting to cpu', 10, 1, @sort_order, @product_version) WITH NOWAIT;
+    IF @get_all_databases = 1
+    BEGIN
+        RAISERROR('Query Store wait stats are not enabled for database %s, but you have requested them. We are skipping this database and continuing with any that remain.', 10, 1, @database_name_quoted) WITH NOWAIT;
+        FETCH NEXT
+        FROM @database_cursor
+        INTO @database_name;
 
-   SELECT
-       @sort_order = N'cpu';
+        CONTINUE;
+    END;
+    ELSE
+    BEGIN
+        RAISERROR('Query Store wait stats are not enabled for database %s, but you have requested them. We are reverting to sorting by cpu without respect for any wait filters.', 10, 1, @database_name_quoted) WITH NOWAIT;
+
+        SELECT
+            @sort_order = N'cpu',
+            @sort_order_is_a_wait = 0,
+            @wait_filter = NULL;
+
+        DELETE
+        FROM @ColumnDefinitions
+        WHERE metric_type IN (N'wait_time');
+
+        UPDATE
+            @ColumnDefinitions
+        SET
+            column_source = N'ROW_NUMBER() OVER (PARTITION BY qsrs.plan_id ORDER BY qsrs.avg_cpu_time_ms DESC)'
+        WHERE metric_type = N'n';
+    END;
+END;
+
+/* There is no reason to show the top_waits column if we know it is NULL. */
+IF
+(
+        @query_store_waits_enabled = 0
+    AND @get_all_databases = 0
+)
+BEGIN
+    DELETE
+    FROM @ColumnDefinitions
+    WHERE metric_type IN (N'top_waits');
 END;
 
 /*Check that the selected @timezone is valid*/
@@ -34028,13 +34628,6 @@ BEGIN
 END;
 
 /*Other filters*/
-IF @execution_count IS NOT NULL
-BEGIN
-    SELECT
-        @having_clause += N'HAVING
-        SUM(qsrs.count_executions) >= @execution_count';
-END;
-
 IF @duration_ms IS NOT NULL
 BEGIN
     SELECT
@@ -35516,6 +36109,121 @@ SELECT
 END;
 
 /*
+Filtering by @execution_count is non-trivial.
+In the Query Store DMVs, execution counts only exist in
+sys.query_store_runtime_stats.
+That DMV has no query_id column (or anything similar),
+but we promised that @execution_count would filter by the
+number of executions of the query.
+The best column for us in the DMV is plan_id, so we need
+to get from there to query_id.
+Because we do most of our filtering work in #distinct_plans,
+we must also make what we do here compatible with that.
+
+In conclusion, we want produce a temp table holding the
+plan_ids for the queries with @execution_count or more executions.
+
+This is similar to the sort-helping tables that you are
+about to see, but easier because we do not need to return or sort
+by the execution count.
+We just need to know that these plans have enough executions.
+*/
+IF @execution_count > 0
+BEGIN
+    SELECT
+        @current_table = 'inserting #plan_ids_having_enough_executions',
+        @sql = @isolation_level;
+
+    IF @troubleshoot_performance = 1
+    BEGIN
+        EXECUTE sys.sp_executesql
+            @troubleshoot_insert,
+          N'@current_table nvarchar(100)',
+            @current_table;
+
+        SET STATISTICS XML ON;
+    END;
+
+    SELECT
+        @sql += N'
+    SELECT DISTINCT
+        unfiltered_execution_counts.plan_id
+    FROM
+    (
+       SELECT
+           qsp.plan_id,
+           total_executions_for_query_of_plan =
+               SUM(qsrs.count_executions) OVER (PARTITION BY qsq.query_id)
+       FROM ' + @database_name_quoted + N'.sys.query_store_query AS qsq
+       JOIN ' + @database_name_quoted + N'.sys.query_store_plan AS qsp
+         ON qsq.query_id = qsp.query_id
+       JOIN ' + @database_name_quoted + N'.sys.query_store_runtime_stats AS qsrs
+         ON qsp.plan_id = qsrs.plan_id
+       WHERE 1 = 1
+       ' + @where_clause
+         + N'
+    ) AS unfiltered_execution_counts
+    WHERE
+        unfiltered_execution_counts.total_executions_for_query_of_plan >= @execution_count
+    OPTION(RECOMPILE);' + @nc10;
+
+    IF @debug = 1
+    BEGIN
+        PRINT LEN(@sql);
+        PRINT @sql;
+    END;
+
+    INSERT
+        #plan_ids_having_enough_executions
+    WITH
+        (TABLOCK)
+    (
+        plan_id
+    )
+    EXECUTE sys.sp_executesql
+        @sql,
+        @parameters,
+        @top,
+        @start_date,
+        @end_date,
+        @execution_count,
+        @duration_ms,
+        @execution_type_desc,
+        @database_id,
+        @queries_top,
+        @work_start_utc,
+        @work_end_utc,
+        @regression_baseline_start_date,
+        @regression_baseline_end_date;
+
+    IF @troubleshoot_performance = 1
+    BEGIN
+        SET STATISTICS XML OFF;
+
+        EXECUTE sys.sp_executesql
+            @troubleshoot_update,
+          N'@current_table nvarchar(100)',
+            @current_table;
+
+        EXECUTE sys.sp_executesql
+            @troubleshoot_info,
+          N'@sql nvarchar(max),
+            @current_table nvarchar(100)',
+            @sql,
+            @current_table;
+    END;
+
+SELECT
+    @where_clause += N'    AND EXISTS
+    (
+        SELECT
+            1/0
+        FROM #plan_ids_having_enough_executions AS enough_executions
+        WHERE enough_executions.plan_id = qsrs.plan_id
+    )' + @nc10;
+END;
+
+/*
 Tidy up the where clause a bit
 */
 SELECT
@@ -35583,8 +36291,8 @@ columns that wouldn't normally be in scope.
 However, they're also quite helpful for the next
 temp table, #distinct_plans.
 
-Note that this block must come after #maintenance_plans
-because that edits @where_clause and we want to use
+Note that this block must come after we are done with
+anything that edits @where_clause because we want to use
 that here.
 
 Regression mode complicates this process considerably.
@@ -36472,8 +37180,6 @@ BEGIN
       + N'
     GROUP BY
         qsrs.plan_id
-    ' + @having_clause
-      + N'
     ORDER BY
         MAX(' +
     CASE @sort_order
@@ -36934,14 +37640,6 @@ CASE @regression_mode
 END
 +
 N'
-' +
-REPLACE
-(
-    @having_clause,
-    'qsrs.',
-    'qsrs_with_lasts.'
-) +
-N'
 OPTION(RECOMPILE, OPTIMIZE FOR (@queries_top = 9223372036854775807));' + @nc10;
 
 IF @debug = 1
@@ -37367,7 +38065,7 @@ BEGIN
         SUM(qsrs.count_executions * (qsrs.avg_num_physical_io_reads * 8)) / 1024.,
         SUM(qsrs.count_executions * qsrs.avg_log_bytes_used) / 100000000.,
         SUM(qsrs.count_executions * (qsrs.avg_tempdb_space_used * 8)) / 1024.'
-      ELSE N'
+      ELSE N',
         NULL,
         NULL,
         NULL'
@@ -37759,8 +38457,10 @@ BEGIN
 END; /*End updating runtime stats*/
 
 /*
-Let's check on settings, etc.
-We do this first so we can see if wait stats capture mode is true more easily
+Check on settings, etc.
+We do this first so we can see if wait stats capture mode is true more easily.
+We do not truncate this table as part of the looping over databases.
+Not truncating it makes it easier to show all set options when hitting multiple databases in expert mode.
 */
 SELECT
     @current_table = 'inserting #database_query_store_options',
@@ -37906,12 +38606,17 @@ If wait stats are available, we'll grab them here
 IF
 (
     @new = 1
-    AND EXISTS
+    /*
+    Recall that we do not care about the edge case of a database holding
+    wait stats despite capturing wait stats being turned off.
+    */
+    AND @database_id IN
         (
             SELECT
-                1/0
+                dqso.database_id
             FROM #database_query_store_options AS dqso
             WHERE dqso.wait_stats_capture_mode_desc = N'ON'
+            AND   dqso.database_id = @database_id
         )
 )
 BEGIN
@@ -38327,7 +39032,6 @@ WHERE EXISTS
               1/0
           FROM #query_store_plan AS qsp
           WHERE qsqv.query_variant_query_id = qsp.query_id
-          AND   qsqv.dispatcher_plan_id = qsp.plan_id
       )
 OPTION(RECOMPILE);' + @nc10;
 
@@ -38629,14 +39333,24 @@ FROM
         qsp.all_plan_ids,' +
         CASE
             WHEN @include_plan_hashes IS NOT NULL
+            OR   @ignore_plan_hashes IS NOT NULL
+            OR   @sort_order = 'plan count by hashes'
             THEN N'
         qsp.query_plan_hash,'
+            ELSE N''
+        END +
+        CASE
             WHEN @include_query_hashes IS NOT NULL
+            OR   @ignore_query_hashes IS NOT NULL
             OR   @sort_order = 'plan count by hashes'
             OR   @include_query_hash_totals = 1
             THEN N'
         qsq.query_hash,'
+            ELSE N''
+        END +
+        CASE
             WHEN @include_sql_handles IS NOT NULL
+            OR   @ignore_sql_handles IS NOT NULL
             THEN N'
         qsqt.statement_sql_handle,'
             ELSE N''
@@ -38976,13 +39690,13 @@ ORDER BY
                   WHEN 'writes' THEN N'x.avg_logical_io_writes_mb'
                   WHEN 'duration' THEN N'x.avg_duration_ms'
                   WHEN 'memory' THEN N'x.avg_query_max_used_memory_mb'
-                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'x.avg_tempdb_space_used_mb' ELSE N'x.avg_cpu_time' END
+                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'x.avg_tempdb_space_used_mb' ELSE N'x.avg_cpu_time_ms' END
                   WHEN 'executions' THEN N'x.count_executions'
                   WHEN 'recent' THEN N'x.last_execution_time'
                   WHEN 'rows' THEN N'x.avg_rowcount'
                   WHEN 'plan count by hashes' THEN N'x.plan_hash_count_for_query_hash DESC,
     x.query_hash_from_hash_counting'
-                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'x.total_wait_time_from_sort_order_ms' ELSE N'x.avg_cpu_time' END
+                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'x.total_wait_time_from_sort_order_ms' ELSE N'x.avg_cpu_time_ms' END
              END END
          /*
          The ORDER BY is on the same level as the topmost SELECT, which is just SELECT x.*.
@@ -39013,13 +39727,13 @@ ORDER BY
                   WHEN 'writes' THEN N'TRY_PARSE(x.avg_logical_io_writes_mb AS money)'
                   WHEN 'duration' THEN N'TRY_PARSE(x.avg_duration_ms AS money)'
                   WHEN 'memory' THEN N'TRY_PARSE(x.avg_query_max_used_memory_mb AS money)'
-                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'TRY_PARSE(x.avg_tempdb_space_used_mb AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time AS money)' END
+                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'TRY_PARSE(x.avg_tempdb_space_used_mb AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time_ms AS money)' END
                   WHEN 'executions' THEN N'TRY_PARSE(x.count_executions AS money)'
                   WHEN 'recent' THEN N'x.last_execution_time'
                   WHEN 'rows' THEN N'TRY_PARSE(x.avg_rowcount AS money)'
                   WHEN 'plan count by hashes' THEN N'TRY_PARSE(x.plan_hash_count_for_query_hash AS money) DESC,
     x.query_hash_from_hash_counting'
-                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'TRY_PARSE(x.total_wait_time_from_sort_order_ms AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time AS money)' END
+                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'TRY_PARSE(x.total_wait_time_from_sort_order_ms AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time_ms AS money)' END
              END END
     END
              + N' DESC
@@ -40064,18 +40778,33 @@ BEGIN
                         CASE
                             WHEN
                             (
-                                    @product_version = 13
-                                AND @azure = 0
+                                  @product_version = 13
+                              AND @azure = 0
                             )
                             THEN ' because it''s not available < 2017'
                             WHEN EXISTS
+                                 (
+                                     SELECT
+                                         1/0
+                                     FROM #database_query_store_options AS dqso
+                                     WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
+                                 )
+                            AND EXISTS
                                 (
                                     SELECT
                                         1/0
                                     FROM #database_query_store_options AS dqso
-                                    WHERE dqso.wait_stats_capture_mode_desc <> 'ON'
+                                    WHERE dqso.wait_stats_capture_mode_desc = N'ON'
                                 )
-                            THEN ' because you have it disabled in your Query Store options'
+                            THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options and everywhere that had it enabled had no data'
+                            WHEN EXISTS
+                                 (
+                                     SELECT
+                                         1/0
+                                     FROM #database_query_store_options AS dqso
+                                     WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
+                                 )
+                            THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options'
                             ELSE ' for the queries in the results'
                         END;
             END;
@@ -40892,6 +41621,29 @@ BEGIN
        (
            SELECT
                1/0
+           FROM #plan_ids_having_enough_executions AS plans
+       )
+    BEGIN
+        SELECT
+            table_name =
+                '#plan_ids_having_enough_executions',
+            plans.*
+        FROM #plan_ids_having_enough_executions AS plans
+        ORDER BY
+            plans.plan_id
+        OPTION(RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+        SELECT
+            result =
+                '#plan_ids_having_enough_executions is empty';
+    END;
+
+    IF EXISTS
+       (
+           SELECT
+               1/0
            FROM #plan_ids_with_query_hashes AS hashes
        )
     BEGIN
@@ -41418,8 +42170,8 @@ BEGIN
                 '#query_store_wait_stats is empty' +
                 CASE
                     WHEN (
-                                @product_version = 13
-                            AND @azure = 0
+                              @product_version = 13
+                          AND @azure = 0
                          )
                     THEN ' because it''s not available < 2017'
                     WHEN EXISTS
@@ -41427,9 +42179,24 @@ BEGIN
                              SELECT
                                  1/0
                              FROM #database_query_store_options AS dqso
-                             WHERE dqso.wait_stats_capture_mode_desc <> 'ON'
+                             WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
                          )
-                    THEN ' because you have it disabled in your Query Store options'
+                    AND EXISTS
+                        (
+                            SELECT
+                                1/0
+                            FROM #database_query_store_options AS dqso
+                            WHERE dqso.wait_stats_capture_mode_desc = N'ON'
+                        )
+                    THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options and everywhere that had it enabled had no data'
+                    WHEN EXISTS
+                         (
+                             SELECT
+                                 1/0
+                             FROM #database_query_store_options AS dqso
+                             WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
+                         )
+                    THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options'
                     ELSE ' for the queries in the results'
                 END;
     END;

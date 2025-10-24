@@ -88,7 +88,7 @@ ALTER PROCEDURE
     @query_type varchar(11) = NULL, /*filter for only ad hoc queries or only from queries from modules*/
     @expert_mode bit = 0, /*returns additional columns and results*/
     @hide_help_table bit = 0, /*hides the "bottom table" that shows help and support information*/
-    @format_output bit = 1, /*returns numbers formatted with commas*/
+    @format_output bit = 1, /*returns numbers formatted with commas and most decimals rounded away*/
     @get_all_databases bit = 0, /*looks for query store enabled user databases and returns combined results from all of them*/
     @include_databases nvarchar(max) = NULL, /*comma-separated list of databases to include (only when @get_all_databases = 1)*/
     @exclude_databases nvarchar(max) = NULL, /*comma-separated list of databases to exclude (only when @get_all_databases = 1)*/
@@ -140,8 +140,8 @@ END;
 These are for your outputs.
 */
 SELECT
-    @version = '5.4.4',
-    @version_date = '20250404';
+    @version = '5.6',
+    @version_date = '20250601';
 
 /*
 Helpful section! For help.
@@ -204,7 +204,7 @@ BEGIN
                 WHEN N'@query_type' THEN 'filter for only ad hoc queries or only from queries from modules'
                 WHEN N'@expert_mode' THEN 'returns additional columns and results'
                 WHEN N'@hide_help_table' THEN 'hides the "bottom table" that shows help and support information'
-                WHEN N'@format_output' THEN 'returns numbers formatted with commas'
+                WHEN N'@format_output' THEN 'returns numbers formatted with commas and most decimals rounded away'
                 WHEN N'@get_all_databases' THEN 'looks for query store enabled user databases and returns combined results from all of them'
                 WHEN N'@include_databases' THEN 'comma-separated list of databases to include (only when @get_all_databases = 1)'
                 WHEN N'@exclude_databases' THEN 'comma-separated list of databases to exclude (only when @get_all_databases = 1)'
@@ -442,6 +442,222 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     RETURN;
 END; /*End @help section*/
 
+
+/*
+Validate Sort Order.
+We do this super early on, because we care about it even
+when populating the tables that we declare very soon.
+*/
+IF @sort_order NOT IN
+   (
+       'cpu',
+       'logical reads',
+       'physical reads',
+       'writes',
+       'duration',
+       'memory',
+       'tempdb',
+       'executions',
+       'recent',
+       'plan count by hashes',
+       'cpu waits',
+       'lock waits',
+       'locks waits',
+       'latch waits',
+       'latches waits',
+       'buffer latch waits',
+       'buffer latches waits',
+       'buffer io waits',
+       'log waits',
+       'log io waits',
+       'network waits',
+       'network io waits',
+       'parallel waits',
+       'parallelism waits',
+       'memory waits',
+       'total waits',
+       'rows'
+   )
+BEGIN
+   RAISERROR('The sort order (%s) you chose is so out of this world that I''m using cpu instead', 10, 1, @sort_order) WITH NOWAIT;
+
+   SELECT
+       @sort_order = 'cpu';
+END;
+
+DECLARE
+    @sort_order_is_a_wait bit;
+
+/*
+Checks if the sort order is for a wait.
+Cuts out a lot of repetition.
+*/
+IF LOWER(@sort_order) IN
+   (
+       'cpu waits',
+       'lock waits',
+       'locks waits',
+       'latch waits',
+       'latches waits',
+       'buffer latch waits',
+       'buffer latches waits',
+       'buffer io waits',
+       'log waits',
+       'log io waits',
+       'network waits',
+       'network io waits',
+       'parallel waits',
+       'parallelism waits',
+       'memory waits',
+       'total waits'
+   )
+BEGIN
+   SELECT
+       @sort_order_is_a_wait = 1;
+END;
+
+/*
+We also validate regression mode super early.
+We need to do this here so we can build @ColumnDefinitions correctly.
+It also lets us fail fast, if needed.
+*/
+DECLARE
+    @regression_mode bit;
+
+/*
+Set @regression_mode if the given arguments indicate that
+we are checking for regressed queries.
+Also set any default parameters for regression mode while we're at it.
+*/
+IF @regression_baseline_start_date IS NOT NULL
+BEGIN
+    SELECT
+        @regression_mode = 1,
+        @regression_comparator =
+            ISNULL(@regression_comparator, 'absolute'),
+        @regression_direction =
+            ISNULL(@regression_direction, 'regressed');
+END;
+
+/*
+Error out if the @regression parameters do not make sense.
+*/
+IF
+(
+  @regression_baseline_start_date IS NULL
+  AND
+  (
+      @regression_baseline_end_date IS NOT NULL
+   OR @regression_comparator IS NOT NULL
+   OR @regression_direction IS NOT NULL
+  )
+)
+BEGIN
+    RAISERROR('@regression_baseline_start_date is mandatory if you have specified any other @regression_ parameter.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Error out if the @regression_baseline_start_date and
+@regression_baseline_end_date are incompatible.
+We could try and guess a sensible resolution, but
+I do not think that we can know what people want.
+*/
+IF
+(
+    @regression_baseline_start_date IS NOT NULL
+AND @regression_baseline_end_date IS NOT NULL
+AND @regression_baseline_start_date >= @regression_baseline_end_date
+)
+BEGIN
+    RAISERROR('@regression_baseline_start_date has been set greater than or equal to @regression_baseline_end_date.
+This does not make sense. Check that the values of both parameters are as you intended them to be.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Validate @regression_comparator.
+*/
+IF
+(
+    @regression_comparator IS NOT NULL
+AND @regression_comparator NOT IN ('relative', 'absolute')
+)
+BEGIN
+   RAISERROR('The regression_comparator (%s) you chose is so out of this world that I''m using ''absolute'' instead', 10, 1, @regression_comparator) WITH NOWAIT;
+
+   SELECT
+       @regression_comparator = 'absolute';
+END;
+
+/*
+Validate @regression_direction.
+*/
+IF
+(
+    @regression_direction IS NOT NULL
+AND @regression_direction NOT IN ('regressed', 'worse', 'improved', 'better', 'magnitude', 'absolute')
+)
+BEGIN
+   RAISERROR('The regression_direction (%s) you chose is so out of this world that I''m using ''regressed'' instead', 10, 1, @regression_direction) WITH NOWAIT;
+
+   SELECT
+       @regression_direction = 'regressed';
+END;
+
+/*
+Error out if we're trying to do regression mode with 'recent'
+as our @sort_order. How could that ever make sense?
+*/
+IF
+(
+    @regression_mode = 1
+AND @sort_order = 'recent'
+)
+BEGIN
+    RAISERROR('Your @sort_order is ''recent'', but you are trying to compare metrics for two time periods.
+If you can imagine a useful way to do that, then make a feature request.
+Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Error out if we're trying to do regression mode with 'plan count by hashes'
+as our @sort_order. How could that ever make sense?
+*/
+IF
+(
+    @regression_mode = 1
+AND @sort_order = 'plan count by hashes'
+)
+BEGIN
+    RAISERROR('Your @sort_order is ''plan count by hashes'', but you are trying to compare metrics for two time periods.
+This is probably not useful, since our method of comparing two time period relies on only checking query hashes that are in both time periods.
+If you can imagine a useful way to do that, then make a feature request.
+Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+Error out if @regression_comparator tells us to use division,
+but @regression_direction tells us to take the modulus.
+It doesn't make sense to specifically ask us to remove the sign
+of something that doesn't care about it.
+*/
+IF
+(
+    @regression_comparator = 'relative'
+AND @regression_direction IN ('absolute', 'magnitude')
+)
+BEGIN
+    RAISERROR('Your @regression_comparator is ''relative'', but you have asked for an ''absolute'' or ''magnitude'' @regression_direction. This is probably a mistake.
+Your @regression_direction tells us to take the absolute value of our result of comparing the metrics in the current time period to the baseline time period,
+but your @regression_comparator is telling us to use division to compare the two time periods. This is unlikely to produce useful results.
+If you can imagine a useful way to do that, then make a feature request. Otherwise, either change @regression_direction to another value
+(e.g. ''better'' or ''worse'') or change @regression_comparator to ''absolute''.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
 /*
 These are the tables that we'll use to grab data from query store
 It will be fun
@@ -537,6 +753,16 @@ CREATE TABLE
             1
         ) PERSISTED NOT NULL
           PRIMARY KEY CLUSTERED
+);
+
+/*
+For filtering by @execution_count.
+This is only used for filtering, so it only needs one column.
+*/
+CREATE TABLE
+    #plan_ids_having_enough_executions
+(
+    plan_id bigint PRIMARY KEY CLUSTERED,
 );
 
 /*
@@ -1255,7 +1481,7 @@ CREATE TABLE
     id bigint IDENTITY PRIMARY KEY CLUSTERED,
     current_table nvarchar(100) NOT NULL,
     start_time datetime NOT NULL,
-    end_time datetime NOT NULL,
+    end_time datetime NULL,
     runtime_ms AS
         FORMAT
         (
@@ -1451,24 +1677,25 @@ BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES
-        (1600, 'sort_order', 'plan_hash_count', 'plan_hash_count_for_query_hash', 'hashes.plan_hash_count_for_query_hash', 0, NULL, NULL, 0, 'N0'),
-        (1610, 'sort_order', 'query_hash', 'query_hash_from_hash_counting', 'hashes.query_hash', 0, NULL, NULL, 0, NULL);
+        /* 230, so just before avg_query_duration_ms. */
+        (230, 'sort_order', 'query_hash', 'query_hash_from_hash_counting', 'hashes.query_hash', 0, NULL, NULL, 0, NULL),
+        (231, 'sort_order', 'plan_hash_count', 'plan_hash_count_for_query_hash', 'hashes.plan_hash_count_for_query_hash', 0, NULL, NULL, 0, 'N0');
 END;
 
 /* Dynamic regression change column based on formatting and comparator */
-IF @regression_baseline_start_date IS NOT NULL AND @regression_comparator = 'relative' AND @format_output = 1
+IF @regression_mode = 1 AND @regression_comparator = 'relative' AND @format_output = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES (160, 'regression', 'change', 'change_in_average_for_query_hash_since_regression_time_period', 'regression.change_since_regression_time_period', 1, 'regression_mode', 1, 0, 'P2');
 END;
-ELSE IF @regression_baseline_start_date IS NOT NULL AND @format_output = 1
+ELSE IF @regression_mode = 1 AND @format_output = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES (160, 'regression', 'change', 'change_in_average_for_query_hash_since_regression_time_period', 'regression.change_since_regression_time_period', 1, 'regression_mode', 1, 0, 'N2');
 END;
-ELSE IF @regression_baseline_start_date IS NOT NULL
+ELSE IF @regression_mode = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
@@ -1476,12 +1703,13 @@ BEGIN
 END;
 
 /* Wait time for wait-based sorting */
-IF LOWER(@sort_order) LIKE N'%waits'
+IF @sort_order_is_a_wait = 1
 BEGIN
     INSERT INTO
         @ColumnDefinitions (column_id, metric_group, metric_type, column_name, column_source, is_conditional, condition_param, condition_value, expert_only, format_pattern)
     VALUES
-        (1620, 'sort_order', 'wait_time', 'total_wait_time_from_sort_order_ms', 'waits.total_query_wait_time_ms', 0, NULL, NULL, 0, 'N0');
+        /* 240, so just before avg_query_duration_ms. */
+        (240, 'sort_order', 'wait_time', 'total_wait_time_from_sort_order_ms', 'waits.total_query_wait_time_ms', 0, NULL, NULL, 0, 'N0');
 END;
 
 /* ROW_NUMBER window function for sorting */
@@ -1494,7 +1722,7 @@ VALUES
         'n',
         'n',
         'ROW_NUMBER() OVER (PARTITION BY qsrs.plan_id ORDER BY ' +
-        CASE WHEN @regression_baseline_start_date IS NOT NULL THEN
+        CASE WHEN @regression_mode = 1 THEN
              /* As seen when populating #regression_changes */
              CASE @regression_direction
                   WHEN 'regressed' THEN 'regression.change_since_regression_time_period'
@@ -1517,8 +1745,8 @@ VALUES
                  WHEN 'recent' THEN 'qsrs.last_execution_time'
                  WHEN 'rows' THEN 'qsrs.avg_rowcount'
                  WHEN 'plan count by hashes' THEN 'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
-                 ELSE CASE WHEN LOWER(@sort_order) LIKE N'%waits' THEN 'waits.total_query_wait_time_ms'
-                 ELSE 'qsrs.avg_cpu_time' END
+                 ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN 'waits.total_query_wait_time_ms'
+                 ELSE 'qsrs.avg_cpu_time_ms' END
             END
         END + ' DESC)',
         0,
@@ -1650,7 +1878,6 @@ DECLARE
     @queries_top bigint,
     @nc10 nvarchar(2),
     @where_clause nvarchar(max),
-    @having_clause nvarchar(max),
     @query_text_search_original_value nvarchar(4000),
     @query_text_search_not_original_value nvarchar(4000),
     @procedure_exists bit,
@@ -1675,10 +1902,8 @@ DECLARE
     @df integer,
     @work_start_utc time(0),
     @work_end_utc time(0),
-    @sort_order_is_a_wait bit,
     @regression_baseline_start_date_original datetimeoffset(7),
     @regression_baseline_end_date_original datetimeoffset(7),
-    @regression_mode bit,
     @regression_where_clause nvarchar(max),
     @column_sql nvarchar(max),
     @param_name nvarchar(100),
@@ -1760,138 +1985,6 @@ SELECT
                 )
             )
         );
-
-/*
-Set @regression_mode if the given arguments indicate that
-we are checking for regressed queries.
-*/
-IF @regression_baseline_start_date IS NOT NULL
-BEGIN
-    SELECT
-        @regression_mode = 1;
-END;
-
-/*
-Error out if the @regression parameters do not make sense.
-*/
-IF
-(
-  @regression_baseline_start_date IS NULL
-  AND
-  (
-      @regression_baseline_end_date IS NOT NULL
-   OR @regression_comparator IS NOT NULL
-   OR @regression_direction IS NOT NULL
-  )
-)
-BEGIN
-    RAISERROR('@regression_baseline_start_date is mandatory if you have specified any other @regression_ parameter.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-/*
-Error out if the @regression_baseline_start_date and
-@regression_baseline_end_date are incompatible.
-We could try and guess a sensible resolution, but
-I do not think that we can know what people want.
-*/
-IF
-(
-    @regression_baseline_start_date IS NOT NULL
-AND @regression_baseline_end_date IS NOT NULL
-AND @regression_baseline_start_date >= @regression_baseline_end_date
-)
-BEGIN
-    RAISERROR('@regression_baseline_start_date has been set greater than or equal to @regression_baseline_end_date.
-This does not make sense. Check that the values of both parameters are as you intended them to be.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-
-/*
-Validate @regression_comparator.
-*/
-IF
-(
-    @regression_comparator IS NOT NULL
-AND @regression_comparator NOT IN ('relative', 'absolute')
-)
-BEGIN
-   RAISERROR('The regression_comparator (%s) you chose is so out of this world that I''m using ''absolute'' instead', 10, 1, @regression_comparator) WITH NOWAIT;
-
-   SELECT
-       @regression_comparator = 'absolute';
-END;
-
-/*
-Validate @regression_direction.
-*/
-IF
-(
-    @regression_direction IS NOT NULL
-AND @regression_direction NOT IN ('regressed', 'worse', 'improved', 'better', 'magnitude', 'absolute')
-)
-BEGIN
-   RAISERROR('The regression_direction (%s) you chose is so out of this world that I''m using ''regressed'' instead', 10, 1, @regression_direction) WITH NOWAIT;
-
-   SELECT
-       @regression_direction = 'regressed';
-END;
-
-/*
-Error out if we're trying to do regression mode with 'recent'
-as our @sort_order. How could that ever make sense?
-*/
-IF
-(
-    @regression_mode = 1
-AND @sort_order = 'recent'
-)
-BEGIN
-    RAISERROR('Your @sort_order is ''recent'', but you are trying to compare metrics for two time periods.
-If you can imagine a useful way to do that, then make a feature request.
-Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-/*
-Error out if we're trying to do regression mode with 'plan count by hashes'
-as our @sort_order. How could that ever make sense?
-*/
-IF
-(
-    @regression_mode = 1
-AND @sort_order = 'plan count by hashes'
-)
-BEGIN
-    RAISERROR('Your @sort_order is ''plan count by hashes'', but you are trying to compare metrics for two time periods.
-This is probably not useful, since our method of comparing two time period relies on only checking query hashes that are in both time periods.
-If you can imagine a useful way to do that, then make a feature request.
-Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
-
-/*
-Error out if @regression_comparator tells us to use division,
-but @regression_direction tells us to take the modulus.
-It doesn't make sense to specifically ask us to remove the sign
-of something that doesn't care about it.
-*/
-IF
-(
-    @regression_comparator = 'relative'
-AND @regression_direction IN ('absolute', 'magnitude')
-)
-BEGIN
-    RAISERROR('Your @regression_comparator is ''relative'', but you have asked for an ''absolute'' or ''magnitude'' @regression_direction. This is probably a mistake.
-Your @regression_direction tells us to take the absolute value of our result of comparing the metrics in the current time period to the baseline time period,
-but your @regression_comparator is telling us to use division to compare the two time periods. This is unlikely to produce useful results.
-If you can imagine a useful way to do that, then make a feature request. Otherwise, either change @regression_direction to another value
-(e.g. ''better'' or ''worse'') or change @regression_comparator to ''absolute''.', 11, 1) WITH NOWAIT;
-    RETURN;
-END;
-
 
 /*
 Set the _original variables, as we have
@@ -2338,6 +2431,9 @@ TRUNCATE TABLE
     #forced_plans_failures;
 
 TRUNCATE TABLE
+    #plan_ids_having_enough_executions;
+
+TRUNCATE TABLE
     #include_plan_ids;
 
 TRUNCATE TABLE
@@ -2474,7 +2570,6 @@ SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;',
         9223372036854775807,
     @nc10 = NCHAR(10),
     @where_clause = N'',
-    @having_clause = N'',
     @query_text_search =
         CASE
             WHEN @get_all_databases = 1
@@ -2805,7 +2900,6 @@ END;
 
 /*
 As above, but for @regression_baseline_start_date and @regression_baseline_end_date.
-We set the other @regression_ variables while we're at it.
 */
 IF @regression_mode = 1
 BEGIN
@@ -2826,11 +2920,7 @@ We set both _date_original variables earlier.
                 MINUTE,
                 @utc_minutes_difference,
                 @regression_baseline_end_date_original
-            ),
-        @regression_comparator =
-            ISNULL(@regression_comparator, 'absolute'),
-        @regression_direction =
-            ISNULL(@regression_direction, 'regressed');
+            );
 END;
 
 /*
@@ -3394,74 +3484,6 @@ BEGIN
 END;
 
 /*
-Validate Sort Order
-*/
-IF @sort_order NOT IN
-   (
-       'cpu',
-       'logical reads',
-       'physical reads',
-       'writes',
-       'duration',
-       'memory',
-       'tempdb',
-       'executions',
-       'recent',
-       'plan count by hashes',
-       'cpu waits',
-       'lock waits',
-       'locks waits',
-       'latch waits',
-       'latches waits',
-       'buffer latch waits',
-       'buffer latches waits',
-       'buffer io waits',
-       'log waits',
-       'log io waits',
-       'network waits',
-       'network io waits',
-       'parallel waits',
-       'parallelism waits',
-       'memory waits',
-       'total waits',
-       'rows'
-   )
-BEGIN
-   RAISERROR('The sort order (%s) you chose is so out of this world that I''m using cpu instead', 10, 1, @sort_order) WITH NOWAIT;
-
-   SELECT
-       @sort_order = 'cpu';
-END;
-
-/*
-Checks if the sort order is for a wait.
-Cuts out a lot of repetition.
-*/
-IF LOWER(@sort_order) IN
-   (
-       'cpu waits',
-       'lock waits',
-       'locks waits',
-       'latch waits',
-       'latches waits',
-       'buffer latch waits',
-       'buffer latches waits',
-       'buffer io waits',
-       'log waits',
-       'log io waits',
-       'network waits',
-       'network io waits',
-       'parallel waits',
-       'parallelism waits',
-       'memory waits',
-       'total waits'
-   )
-BEGIN
-   SELECT
-       @sort_order_is_a_wait = 1;
-END;
-
-/*
 See if our cool new 2022 views exist.
 May have to tweak this if views aren't present in some cloudy situations.
 */
@@ -3577,12 +3599,47 @@ BEGIN
 END;
 
 /*
-One last check: wait stat capture can be enabled or disabled in settings
+These columns are only available in 2017+.
+This is an instance-level check.
+We do it before the database-level checks because the relevant DMVs may not exist on old versions.
+@wait_filter has already been checked.
 */
 IF
 (
-   @wait_filter IS NOT NULL
-OR @new = 1
+  (
+      @sort_order = 'tempdb'
+   OR @sort_order_is_a_wait = 1
+  )
+  AND
+  (
+      @new = 0
+  )
+)
+BEGIN
+   RAISERROR('The sort order (%s) you chose is invalid in product version %i, reverting to sorting by cpu.', 10, 1, @sort_order, @product_version) WITH NOWAIT;
+
+   SELECT
+       @sort_order = N'cpu',
+       @sort_order_is_a_wait = 0;
+
+   DELETE
+   FROM @ColumnDefinitions
+   WHERE metric_type IN (N'wait_time', N'top waits');
+
+   UPDATE
+       @ColumnDefinitions
+   SET
+       column_source = N'ROW_NUMBER() OVER (PARTITION BY qsrs.plan_id ORDER BY qsrs.avg_cpu_time_ms DESC)'
+   WHERE metric_type = N'n';
+END;
+
+/*
+Wait stat capture can be enabled or disabled in settings.
+This is a database-level check.
+*/
+IF
+(
+  @new = 1
 )
 BEGIN
     SELECT
@@ -3644,36 +3701,70 @@ OPTION(RECOMPILE);' + @nc10;
             @sql,
             @current_table;
     END;
-
-    IF @query_store_waits_enabled = 0
-    BEGIN
-        IF @debug = 1
-        BEGIN
-            RAISERROR('Query Store wait stats are not enabled for database %s', 10, 1, @database_name_quoted) WITH NOWAIT;
-        END;
-    END;
-END; /*End wait stats checks*/
+END;
 
 /*
-These columns are only available in 2017+
+To avoid mixing sort orders in the @get_all_databases = 1 case, we skip the
+database if something wait related is requested on a database that does not capture waits.
+
+There is an edge case.
+If you have capturing wait stats disabled, your database can still hold wait stats.
+This happens if you turned capturing off after having it on.
+We make no attempt to handle this.
+Instead, we assume that anyone with capturing wait stats turned off does not want to see them.
 */
 IF
 (
   (
-      @sort_order = 'tempdb'
+      @wait_filter IS NOT NULL
    OR @sort_order_is_a_wait = 1
   )
   AND
   (
-       @new = 0
-    OR @query_store_waits_enabled = 0
+      @query_store_waits_enabled = 0
   )
 )
 BEGIN
-   RAISERROR('The sort order (%s) you chose is invalid in product version %i, reverting to cpu', 10, 1, @sort_order, @product_version) WITH NOWAIT;
+    IF @get_all_databases = 1
+    BEGIN
+        RAISERROR('Query Store wait stats are not enabled for database %s, but you have requested them. We are skipping this database and continuing with any that remain.', 10, 1, @database_name_quoted) WITH NOWAIT;
+        FETCH NEXT
+        FROM @database_cursor
+        INTO @database_name;
 
-   SELECT
-       @sort_order = N'cpu';
+        CONTINUE;
+    END;
+    ELSE
+    BEGIN
+        RAISERROR('Query Store wait stats are not enabled for database %s, but you have requested them. We are reverting to sorting by cpu without respect for any wait filters.', 10, 1, @database_name_quoted) WITH NOWAIT;
+
+        SELECT
+            @sort_order = N'cpu',
+            @sort_order_is_a_wait = 0,
+            @wait_filter = NULL;
+
+        DELETE
+        FROM @ColumnDefinitions
+        WHERE metric_type IN (N'wait_time');
+
+        UPDATE
+            @ColumnDefinitions
+        SET
+            column_source = N'ROW_NUMBER() OVER (PARTITION BY qsrs.plan_id ORDER BY qsrs.avg_cpu_time_ms DESC)'
+        WHERE metric_type = N'n';
+    END;
+END;
+
+/* There is no reason to show the top_waits column if we know it is NULL. */
+IF
+(
+        @query_store_waits_enabled = 0
+    AND @get_all_databases = 0
+)
+BEGIN
+    DELETE
+    FROM @ColumnDefinitions
+    WHERE metric_type IN (N'top_waits');
 END;
 
 /*Check that the selected @timezone is valid*/
@@ -3747,13 +3838,6 @@ BEGIN
 END;
 
 /*Other filters*/
-IF @execution_count IS NOT NULL
-BEGIN
-    SELECT
-        @having_clause += N'HAVING
-        SUM(qsrs.count_executions) >= @execution_count';
-END;
-
 IF @duration_ms IS NOT NULL
 BEGIN
     SELECT
@@ -5235,6 +5319,121 @@ SELECT
 END;
 
 /*
+Filtering by @execution_count is non-trivial.
+In the Query Store DMVs, execution counts only exist in
+sys.query_store_runtime_stats.
+That DMV has no query_id column (or anything similar),
+but we promised that @execution_count would filter by the
+number of executions of the query.
+The best column for us in the DMV is plan_id, so we need
+to get from there to query_id.
+Because we do most of our filtering work in #distinct_plans,
+we must also make what we do here compatible with that.
+
+In conclusion, we want produce a temp table holding the
+plan_ids for the queries with @execution_count or more executions.
+
+This is similar to the sort-helping tables that you are
+about to see, but easier because we do not need to return or sort
+by the execution count.
+We just need to know that these plans have enough executions.
+*/
+IF @execution_count > 0
+BEGIN
+    SELECT
+        @current_table = 'inserting #plan_ids_having_enough_executions',
+        @sql = @isolation_level;
+
+    IF @troubleshoot_performance = 1
+    BEGIN
+        EXECUTE sys.sp_executesql
+            @troubleshoot_insert,
+          N'@current_table nvarchar(100)',
+            @current_table;
+
+        SET STATISTICS XML ON;
+    END;
+
+    SELECT
+        @sql += N'
+    SELECT DISTINCT
+        unfiltered_execution_counts.plan_id
+    FROM
+    (
+       SELECT
+           qsp.plan_id,
+           total_executions_for_query_of_plan =
+               SUM(qsrs.count_executions) OVER (PARTITION BY qsq.query_id)
+       FROM ' + @database_name_quoted + N'.sys.query_store_query AS qsq
+       JOIN ' + @database_name_quoted + N'.sys.query_store_plan AS qsp
+         ON qsq.query_id = qsp.query_id
+       JOIN ' + @database_name_quoted + N'.sys.query_store_runtime_stats AS qsrs
+         ON qsp.plan_id = qsrs.plan_id
+       WHERE 1 = 1
+       ' + @where_clause
+         + N'
+    ) AS unfiltered_execution_counts
+    WHERE
+        unfiltered_execution_counts.total_executions_for_query_of_plan >= @execution_count
+    OPTION(RECOMPILE);' + @nc10;
+
+    IF @debug = 1
+    BEGIN
+        PRINT LEN(@sql);
+        PRINT @sql;
+    END;
+
+    INSERT
+        #plan_ids_having_enough_executions
+    WITH
+        (TABLOCK)
+    (
+        plan_id
+    )
+    EXECUTE sys.sp_executesql
+        @sql,
+        @parameters,
+        @top,
+        @start_date,
+        @end_date,
+        @execution_count,
+        @duration_ms,
+        @execution_type_desc,
+        @database_id,
+        @queries_top,
+        @work_start_utc,
+        @work_end_utc,
+        @regression_baseline_start_date,
+        @regression_baseline_end_date;
+
+    IF @troubleshoot_performance = 1
+    BEGIN
+        SET STATISTICS XML OFF;
+
+        EXECUTE sys.sp_executesql
+            @troubleshoot_update,
+          N'@current_table nvarchar(100)',
+            @current_table;
+
+        EXECUTE sys.sp_executesql
+            @troubleshoot_info,
+          N'@sql nvarchar(max),
+            @current_table nvarchar(100)',
+            @sql,
+            @current_table;
+    END;
+
+SELECT
+    @where_clause += N'    AND EXISTS
+    (
+        SELECT
+            1/0
+        FROM #plan_ids_having_enough_executions AS enough_executions
+        WHERE enough_executions.plan_id = qsrs.plan_id
+    )' + @nc10;
+END;
+
+/*
 Tidy up the where clause a bit
 */
 SELECT
@@ -5302,8 +5501,8 @@ columns that wouldn't normally be in scope.
 However, they're also quite helpful for the next
 temp table, #distinct_plans.
 
-Note that this block must come after #maintenance_plans
-because that edits @where_clause and we want to use
+Note that this block must come after we are done with
+anything that edits @where_clause because we want to use
 that here.
 
 Regression mode complicates this process considerably.
@@ -6191,8 +6390,6 @@ BEGIN
       + N'
     GROUP BY
         qsrs.plan_id
-    ' + @having_clause
-      + N'
     ORDER BY
         MAX(' +
     CASE @sort_order
@@ -6653,14 +6850,6 @@ CASE @regression_mode
 END
 +
 N'
-' +
-REPLACE
-(
-    @having_clause,
-    'qsrs.',
-    'qsrs_with_lasts.'
-) +
-N'
 OPTION(RECOMPILE, OPTIMIZE FOR (@queries_top = 9223372036854775807));' + @nc10;
 
 IF @debug = 1
@@ -7086,7 +7275,7 @@ BEGIN
         SUM(qsrs.count_executions * (qsrs.avg_num_physical_io_reads * 8)) / 1024.,
         SUM(qsrs.count_executions * qsrs.avg_log_bytes_used) / 100000000.,
         SUM(qsrs.count_executions * (qsrs.avg_tempdb_space_used * 8)) / 1024.'
-      ELSE N'
+      ELSE N',
         NULL,
         NULL,
         NULL'
@@ -7478,8 +7667,10 @@ BEGIN
 END; /*End updating runtime stats*/
 
 /*
-Let's check on settings, etc.
-We do this first so we can see if wait stats capture mode is true more easily
+Check on settings, etc.
+We do this first so we can see if wait stats capture mode is true more easily.
+We do not truncate this table as part of the looping over databases.
+Not truncating it makes it easier to show all set options when hitting multiple databases in expert mode.
 */
 SELECT
     @current_table = 'inserting #database_query_store_options',
@@ -7625,12 +7816,17 @@ If wait stats are available, we'll grab them here
 IF
 (
     @new = 1
-    AND EXISTS
+    /*
+    Recall that we do not care about the edge case of a database holding
+    wait stats despite capturing wait stats being turned off.
+    */
+    AND @database_id IN
         (
             SELECT
-                1/0
+                dqso.database_id
             FROM #database_query_store_options AS dqso
             WHERE dqso.wait_stats_capture_mode_desc = N'ON'
+            AND   dqso.database_id = @database_id
         )
 )
 BEGIN
@@ -8046,7 +8242,6 @@ WHERE EXISTS
               1/0
           FROM #query_store_plan AS qsp
           WHERE qsqv.query_variant_query_id = qsp.query_id
-          AND   qsqv.dispatcher_plan_id = qsp.plan_id
       )
 OPTION(RECOMPILE);' + @nc10;
 
@@ -8348,14 +8543,24 @@ FROM
         qsp.all_plan_ids,' +
         CASE
             WHEN @include_plan_hashes IS NOT NULL
+            OR   @ignore_plan_hashes IS NOT NULL
+            OR   @sort_order = 'plan count by hashes'
             THEN N'
         qsp.query_plan_hash,'
+            ELSE N''
+        END +
+        CASE
             WHEN @include_query_hashes IS NOT NULL
+            OR   @ignore_query_hashes IS NOT NULL
             OR   @sort_order = 'plan count by hashes'
             OR   @include_query_hash_totals = 1
             THEN N'
         qsq.query_hash,'
+            ELSE N''
+        END +
+        CASE
             WHEN @include_sql_handles IS NOT NULL
+            OR   @ignore_sql_handles IS NOT NULL
             THEN N'
         qsqt.statement_sql_handle,'
             ELSE N''
@@ -8695,13 +8900,13 @@ ORDER BY
                   WHEN 'writes' THEN N'x.avg_logical_io_writes_mb'
                   WHEN 'duration' THEN N'x.avg_duration_ms'
                   WHEN 'memory' THEN N'x.avg_query_max_used_memory_mb'
-                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'x.avg_tempdb_space_used_mb' ELSE N'x.avg_cpu_time' END
+                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'x.avg_tempdb_space_used_mb' ELSE N'x.avg_cpu_time_ms' END
                   WHEN 'executions' THEN N'x.count_executions'
                   WHEN 'recent' THEN N'x.last_execution_time'
                   WHEN 'rows' THEN N'x.avg_rowcount'
                   WHEN 'plan count by hashes' THEN N'x.plan_hash_count_for_query_hash DESC,
     x.query_hash_from_hash_counting'
-                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'x.total_wait_time_from_sort_order_ms' ELSE N'x.avg_cpu_time' END
+                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'x.total_wait_time_from_sort_order_ms' ELSE N'x.avg_cpu_time_ms' END
              END END
          /*
          The ORDER BY is on the same level as the topmost SELECT, which is just SELECT x.*.
@@ -8732,13 +8937,13 @@ ORDER BY
                   WHEN 'writes' THEN N'TRY_PARSE(x.avg_logical_io_writes_mb AS money)'
                   WHEN 'duration' THEN N'TRY_PARSE(x.avg_duration_ms AS money)'
                   WHEN 'memory' THEN N'TRY_PARSE(x.avg_query_max_used_memory_mb AS money)'
-                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'TRY_PARSE(x.avg_tempdb_space_used_mb AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time AS money)' END
+                  WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'TRY_PARSE(x.avg_tempdb_space_used_mb AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time_ms AS money)' END
                   WHEN 'executions' THEN N'TRY_PARSE(x.count_executions AS money)'
                   WHEN 'recent' THEN N'x.last_execution_time'
                   WHEN 'rows' THEN N'TRY_PARSE(x.avg_rowcount AS money)'
                   WHEN 'plan count by hashes' THEN N'TRY_PARSE(x.plan_hash_count_for_query_hash AS money) DESC,
     x.query_hash_from_hash_counting'
-                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'TRY_PARSE(x.total_wait_time_from_sort_order_ms AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time AS money)' END
+                  ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'TRY_PARSE(x.total_wait_time_from_sort_order_ms AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time_ms AS money)' END
              END END
     END
              + N' DESC
@@ -9783,18 +9988,33 @@ BEGIN
                         CASE
                             WHEN
                             (
-                                    @product_version = 13
-                                AND @azure = 0
+                                  @product_version = 13
+                              AND @azure = 0
                             )
                             THEN ' because it''s not available < 2017'
                             WHEN EXISTS
+                                 (
+                                     SELECT
+                                         1/0
+                                     FROM #database_query_store_options AS dqso
+                                     WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
+                                 )
+                            AND EXISTS
                                 (
                                     SELECT
                                         1/0
                                     FROM #database_query_store_options AS dqso
-                                    WHERE dqso.wait_stats_capture_mode_desc <> 'ON'
+                                    WHERE dqso.wait_stats_capture_mode_desc = N'ON'
                                 )
-                            THEN ' because you have it disabled in your Query Store options'
+                            THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options and everywhere that had it enabled had no data'
+                            WHEN EXISTS
+                                 (
+                                     SELECT
+                                         1/0
+                                     FROM #database_query_store_options AS dqso
+                                     WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
+                                 )
+                            THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options'
                             ELSE ' for the queries in the results'
                         END;
             END;
@@ -10611,6 +10831,29 @@ BEGIN
        (
            SELECT
                1/0
+           FROM #plan_ids_having_enough_executions AS plans
+       )
+    BEGIN
+        SELECT
+            table_name =
+                '#plan_ids_having_enough_executions',
+            plans.*
+        FROM #plan_ids_having_enough_executions AS plans
+        ORDER BY
+            plans.plan_id
+        OPTION(RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+        SELECT
+            result =
+                '#plan_ids_having_enough_executions is empty';
+    END;
+
+    IF EXISTS
+       (
+           SELECT
+               1/0
            FROM #plan_ids_with_query_hashes AS hashes
        )
     BEGIN
@@ -11137,8 +11380,8 @@ BEGIN
                 '#query_store_wait_stats is empty' +
                 CASE
                     WHEN (
-                                @product_version = 13
-                            AND @azure = 0
+                              @product_version = 13
+                          AND @azure = 0
                          )
                     THEN ' because it''s not available < 2017'
                     WHEN EXISTS
@@ -11146,9 +11389,24 @@ BEGIN
                              SELECT
                                  1/0
                              FROM #database_query_store_options AS dqso
-                             WHERE dqso.wait_stats_capture_mode_desc <> 'ON'
+                             WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
                          )
-                    THEN ' because you have it disabled in your Query Store options'
+                    AND EXISTS
+                        (
+                            SELECT
+                                1/0
+                            FROM #database_query_store_options AS dqso
+                            WHERE dqso.wait_stats_capture_mode_desc = N'ON'
+                        )
+                    THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options and everywhere that had it enabled had no data'
+                    WHEN EXISTS
+                         (
+                             SELECT
+                                 1/0
+                             FROM #database_query_store_options AS dqso
+                             WHERE dqso.wait_stats_capture_mode_desc <> N'ON'
+                         )
+                    THEN ' because we ignore wait stats if you have disabled capturing them in your Query Store options'
                     ELSE ' for the queries in the results'
                 END;
     END;
